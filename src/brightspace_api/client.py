@@ -119,6 +119,25 @@ for the full detail. Short version:
   exercised against a live assignment (real, hard-to-reverse academic
   action) and defaults off (`confirm_submit=False`). See upload()'s own
   docstring before turning that on for real.
+
+2026-08-05, later same day, added get_module_content() and
+get_external_link() (found via a real Jan screenshot of an "External
+Resource" topic he couldn't get data for). Short version, see each
+method's own docstring for the full detail:
+- get_course_content() has a real gap: a module's content isn't
+  necessarily flat, and it only ever sees whichever single folder
+  happens to already be selected. Confirmed live 3 levels deep on a real
+  course (Week module -> a lecture sub-folder -> a further "Werkcollege"
+  sub-folder). get_module_content() walks a module's whole subtree
+  instead - needed real DOM investigation to get right (direct-child-only
+  tree selection, `:scope > ul > li...`, not "all descendants", to avoid
+  double-visiting deeper folders).
+- get_external_link() resolves an External Resource/External Learning
+  Tool topic's "Open in New Window" destination by actually clicking it -
+  confirmed live it sometimes resolves cleanly (an LTI-launched tool,
+  already authenticated via the existing session) and sometimes lands on
+  a separate service's own login page instead (a plain external link
+  needing its own auth) - this can't distinguish the two automatically.
 """
 import re
 import urllib.parse
@@ -439,6 +458,173 @@ class BrightspaceClient:
             block = page.locator("div.d2l-htmlblock-untrusted d2l-html-block").first
             description_html = block.get_attribute("html") if block.count() else None
             return {"name": matched_name, "description_html": description_html}
+        finally:
+            context.close()
+
+    def get_module_content(self, org_unit_id: str, module_name: str) -> list[dict] | None:
+        """Like get_course_content, but scoped to one specific top-level
+        module (matched the same way as get_module_description - see its
+        docstring for why clicking is unavoidable here) and - unlike
+        get_course_content - actually descends into that module's nested
+        sub-folders instead of only seeing whichever single folder
+        happens to be selected.
+
+        This exists because get_course_content has a real, confirmed-live
+        gap: a module's content isn't necessarily flat. Real example:
+        Sterkteleer's "Week 1: Spanning en Rek" module contains a
+        sub-folder "College 1 Spanning", which itself contains a further
+        sub-folder "Werkcollege 1" - three levels deep before reaching
+        actual files. get_course_content() only ever sees whichever ONE
+        of these happens to be the currently-selected view; it has no way
+        to know the others exist. This method walks the whole subtree
+        under module_name instead, however deep it goes (bounded by
+        max_depth as a safety cap - not because deeper nesting was
+        observed, just as a defensive limit against an unexpected
+        circular/runaway tree).
+
+        Each returned item has a `folder_path` field - a list of folder
+        names from the module root down to wherever the item actually
+        lives (e.g. `["College 1 Spanning", "Werkcollege 1"]`, or `[]` for
+        an item directly in the module itself) - so results from
+        different folders aren't ambiguous.
+
+        Direct-child selection (not "all descendants") is the whole
+        reason this needed real DOM investigation rather than reusing
+        get_course_content's simpler query: a naive
+        `tree_item.locator("li.d2l-le-TreeAccordionItem")` matches EVERY
+        descendant at any depth, not just immediate children, which would
+        silently double-visit deeper folders once as a false direct child
+        and again during real recursion. Confirmed live that
+        `:scope > ul > li.d2l-le-TreeAccordionItem` isolates exactly one
+        level at a time instead.
+
+        **Known ambiguity, deliberately not papered over**: for a module
+        that has ONLY sub-folders and no items of its own (confirmed live
+        - Sterkteleer's "Week 1" module itself), clicking it doesn't show
+        an empty/distinct "module root" view - it shows its first
+        sub-folder's content instead, which this then records with
+        `folder_path: []` as if it belonged directly to the module, even
+        though it's really a duplicate of that first sub-folder's own
+        entries. Separately, a folder that has BOTH its own items AND a
+        sub-folder (confirmed live - "College 2 Rek, Staven, Superpositie")
+        showed a mix that partially, but not fully, overlapped with its
+        sub-folder's own listing - which could be the same UI-default
+        behavior, or could be genuinely intentional (D2L lets the same
+        file be linked into multiple locations). Couldn't distinguish
+        the two live, so: don't treat `folder_path: []` results as
+        authoritative "this is definitely only here" without checking
+        for near-duplicate entries deeper in the same result list.
+
+        Returns None if no module matched module_name."""
+        base_url = self._base_url()
+        context, page = self._new_page()
+        try:
+            page.goto(f"{base_url}/d2l/le/content/{org_unit_id}/Home", wait_until="networkidle")
+            page.wait_for_timeout(2000)
+            items = page.locator("li.d2l-le-TreeAccordionItem-Root")
+            target_item = None
+            for i in range(items.count()):
+                item = items.nth(i)
+                anchor = item.locator("a.d2l-le-TreeAccordionItem-anchor").first
+                if anchor.count() == 0:
+                    continue
+                name = anchor.inner_text().split("\n")[0].strip()
+                if module_name.lower() in name.lower():
+                    target_item = item
+                    break
+            if target_item is None:
+                return None
+
+            results = []
+            self._collect_content_items(page, base_url, target_item, folder_path=[], results=results, depth=0)
+            return results
+        finally:
+            context.close()
+
+    def _collect_content_items(self, page, base_url, tree_item, folder_path, results, depth, max_depth=6):
+        anchor = tree_item.locator("a.d2l-le-TreeAccordionItem-anchor").first
+        anchor.click()
+        page.wait_for_timeout(1500)
+
+        file_items = page.locator('a.d2l-link[href*="/viewContent/"]')
+        for i in range(file_items.count()):
+            it = file_items.nth(i)
+            href = it.get_attribute("href")
+            title_attr = it.get_attribute("title") or ""
+            m = re.match(r"/d2l/le/content/\d+/viewContent/(\d+)/View", href or "")
+            file_type = title_attr.rsplit(" - ", 1)[-1] if " - " in title_attr else None
+            results.append({
+                "topic_id": m.group(1) if m else None,
+                "title": it.inner_text().strip(),
+                "file_type": file_type,
+                "url": f"{base_url}{href}" if href and href.startswith("/") else href,
+                "folder_path": list(folder_path),
+            })
+
+        if depth >= max_depth:
+            return
+        sub_items = tree_item.locator(":scope > ul > li.d2l-le-TreeAccordionItem")
+        for i in range(sub_items.count()):
+            sub = sub_items.nth(i)
+            sub_anchor = sub.locator("a.d2l-le-TreeAccordionItem-anchor").first
+            if sub_anchor.count() == 0:
+                continue
+            sub_name = sub_anchor.inner_text().split("\n")[0].strip()
+            self._collect_content_items(
+                page, base_url, sub, folder_path=folder_path + [sub_name], results=results, depth=depth + 1
+            )
+
+    def get_external_link(self, org_unit_id: str, topic_id: str) -> dict:
+        """Resolves the real destination behind a Content topic's "Open
+        in New Window" button (External Resource / External Learning
+        Tool topics - the kind get_course_content()/get_module_content()
+        list with a `file_type` that isn't a plain file). The button's
+        destination isn't a static href in the page - Brightspace
+        resolves it via JS at click time (often an LTI launch through
+        `/d2l/lti/...` that hands off a signed, already-authenticated
+        request) - so this actually clicks it and reports where the
+        resulting new tab lands.
+
+        Confirmed live against two real, different cases:
+        - An "External Learning Tool" (LTI) topic resolved cleanly all
+          the way through to the real destination (ans.app, a quiz
+          platform) with no extra login needed - the LTI handshake
+          authenticates it directly using the existing Brightspace
+          session.
+        - A plain "External Resource" topic (a lecture-recording link)
+          did NOT resolve all the way - it landed on a completely
+          separate service's own SSO login page instead, because that
+          particular external tool needs its own authentication beyond
+          whatever the Brightspace session covers.
+
+        Because of that second case, treat the returned `url`/`title` as
+        "wherever the button's own navigation ended up", not a guaranteed
+        final content URL - this doesn't try to detect "did I land on a
+        login page" automatically, that signal isn't reliable enough
+        across arbitrary external tools/institutions to hardcode."""
+        base_url = self._base_url()
+        context, page = self._new_page()
+        try:
+            view_url = f"{base_url}/d2l/le/content/{org_unit_id}/viewContent/{topic_id}/View"
+            page.goto(view_url, wait_until="networkidle")
+            page.wait_for_timeout(1500)
+
+            btn = page.locator('button:has-text("Open in New Window")').first
+            if btn.count() == 0:
+                raise BrightspaceError(
+                    "No 'Open in New Window' button found - this topic might be a plain file "
+                    "(use download_course_file instead) or a type not seen yet."
+                )
+            with page.context.expect_page() as new_page_info:
+                btn.click()
+            new_page = new_page_info.value
+            try:
+                new_page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass  # some destinations keep a long-lived connection open (streaming, polling) - report wherever it got to rather than hang
+            result = {"url": new_page.url, "title": new_page.title()}
+            new_page.close()
+            return result
         finally:
             context.close()
 

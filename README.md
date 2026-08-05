@@ -65,7 +65,9 @@ the `[server]` extra installed) an HTTP endpoint on the same shape:
 | `get_course_content(ou)` | `/api/courses/{ou}/content` | Files/topics in a course's Content area (see caveat below) |
 | `get_course_modules(ou)` | `/api/courses/{ou}/modules` | Top-level module names/ids in a course's Content tree |
 | `get_module_description(ou, name)` | `/api/courses/{ou}/modules/description?name=` | A specific module's own description/overview text (e.g. weekly "Leerdoelen" blocks) |
+| `get_module_content(ou, name)` | `/api/courses/{ou}/modules/content?name=` | Everything under a module, **including nested sub-folders** — see caveat below |
 | `download_course_file(ou, topic_id)` | `/api/courses/{ou}/download/{topic_id}` | Downloads a content file (PDF-backed topics only so far) |
+| `get_external_link(ou, topic_id)` | `/api/courses/{ou}/content/{topic_id}/external-link` | Resolves an "External Resource"/"External Learning Tool" topic's real destination URL |
 | `get_course_grades(ou)` | `/api/courses/{ou}/grades` | Grade items + scores + written feedback |
 | `get_course_assignments(ou)` | `/api/courses/{ou}/assignments` | Assignment/Dropbox folders: due dates, submission status, score, feedback link |
 | `get_course_discussions(ou)` | `/api/courses/{ou}/discussions` | Forum topics per course: thread/post counts, unread flag |
@@ -186,7 +188,29 @@ All via `.env` (in the current working directory by default — set
   navigates elsewhere. For a course with many modules, the reliable way
   to see everything is a real interactive session (browse Content
   yourself once to find topic IDs across all modules), then use
-  `download_course_file` with those IDs directly.
+  `download_course_file` with those IDs directly — or use
+  `get_module_content()` instead, which walks a specific module's full
+  subtree (including nested sub-folders) rather than relying on whatever
+  happens to already be selected.
+- **`get_module_content()`'s folder-level results have a known
+  ambiguity.** A module/folder that has ONLY sub-folders and no items of
+  its own shows its first sub-folder's content instead of an empty view
+  when clicked (confirmed live) — recorded with `folder_path: []` even
+  though it's really a duplicate of that sub-folder's own entries. A
+  folder with BOTH its own items and a sub-folder showed a *partial*
+  overlap with the sub-folder's listing, which could be the same
+  artifact or genuinely intentional (D2L allows linking the same file
+  into multiple locations) — this wasn't distinguishable live. Don't
+  treat `folder_path: []` results as authoritative without checking for
+  near-duplicates deeper in the same result list.
+- **External link resolution isn't guaranteed to reach real content.**
+  `get_external_link()` clicks the topic's own "Open in New Window"
+  button and reports wherever the resulting tab lands — confirmed live
+  this sometimes IS the real destination (an LTI-launched tool,
+  authenticated via the existing Brightspace session with no extra
+  login) and sometimes ISN'T (a plain external link to a service with
+  its own separate SSO, landing on that service's login page instead).
+  This doesn't try to detect which case occurred.
 - **Quizzes and Calendar are not implemented.** Quizzes: no course this
   was tested against had any quiz data to build a real parser against —
   don't guess at a DOM you haven't seen populated, dump the page and

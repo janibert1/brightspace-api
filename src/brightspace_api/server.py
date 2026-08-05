@@ -122,6 +122,20 @@ async def get_module_description(org_unit_id: str, name: str):
     return result
 
 
+@app.get("/api/courses/{org_unit_id}/modules/content")
+async def get_module_content(org_unit_id: str, name: str):
+    """`name` as a query param, same reason as modules/description above."""
+    result = await _run(BrightspaceClient.get_module_content, org_unit_id, name)
+    if result is None:
+        raise HTTPException(404, f"No module matching {name!r} found in this course's content tree.")
+    return result
+
+
+@app.get("/api/courses/{org_unit_id}/content/{topic_id}/external-link")
+async def get_external_link(org_unit_id: str, topic_id: str):
+    return await _run(BrightspaceClient.get_external_link, org_unit_id, topic_id)
+
+
 @app.get("/api/notifications")
 async def get_notifications():
     return await _run(BrightspaceClient.get_notifications)
