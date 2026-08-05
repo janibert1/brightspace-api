@@ -202,6 +202,21 @@ WALK_SHADOW_JS = """
 """
 
 
+# Best-effort patterns for "did this navigation land on a login page" -
+# see get_external_link's docstring for what this is and isn't good for.
+# Deliberately broad/generic (subdomain conventions + common
+# EN/NL login wording) rather than TU-Delft-specific, but only ever
+# verified against one real institution's SSO page - treat matches as a
+# hint, not a certainty.
+_LOGIN_URL_HINTS = ("login.", "sso.", "auth.", "/login", "/sso/", "/signin", "/sign-in")
+_LOGIN_TITLE_HINTS = ("log in", "login", "sign in", "inloggen")
+
+
+def _looks_like_login_page(url: str, title: str) -> bool:
+    url_l, title_l = (url or "").lower(), (title or "").lower()
+    return any(h in url_l for h in _LOGIN_URL_HINTS) or any(h in title_l for h in _LOGIN_TITLE_HINTS)
+
+
 class BrightspaceError(Exception):
     """Raised for anything that isn't a plain "0 results" case - no saved
     session, an unexpected page shape, a failed file download, etc."""
@@ -380,16 +395,27 @@ class BrightspaceClient:
         finally:
             context.close()
 
-    def get_course_modules(self, org_unit_id: str) -> list[dict]:
+    def get_course_modules(self, org_unit_id: str, include_navigation_tabs: bool = False) -> list[dict]:
         """Lists the top-level module tree entries in a course's Content
         area (id + name) - e.g. "Week 1: Spanning en Rek". Use `name`
-        with get_module_description() to load that specific module's own
-        description/overview text. Doesn't descend into sub-modules (a
-        module nested inside another doesn't get its own entry here).
-        The tree itself is JS-driven (see get_module_description's
-        docstring for why that matters), but listing the top-level names
-        doesn't require clicking anything - only loading one specific
-        module's description text does."""
+        with get_module_description() or get_module_content() to load
+        that specific module's own description text or full subtree.
+        Only lists TOP-level modules (a module nested inside another
+        doesn't get its own entry here) - get_module_content() descends
+        into a given module's own nested sub-folders, but this listing
+        itself stays flat. The tree itself is JS-driven (see
+        get_module_description's docstring for why that matters), but
+        listing the top-level names doesn't require clicking anything -
+        only loading one specific module's content/description does.
+
+        By default, excludes a handful of fixed navigational tabs that
+        live in the same tree as real modules but aren't actual content
+        (confirmed live: "Overview", "Bookmarks", "Course Schedule",
+        "Table of Contents" - always present, generic across TU Delft
+        courses, never had a `module_id`). Pass
+        `include_navigation_tabs=True` to get the old, unfiltered
+        behavior back (those items are still returned with
+        `module_id: None`, same as before)."""
         base_url = self._base_url()
         context, page = self._new_page()
         try:
@@ -401,6 +427,9 @@ class BrightspaceClient:
                 item = items.nth(i)
                 data_key = item.get_attribute("data-key") or ""
                 m = re.search(r"ModuleCO-(\d+)", data_key)
+                module_id = m.group(1) if m else None
+                if module_id is None and not include_navigation_tabs:
+                    continue
                 anchor = item.locator("a.d2l-le-TreeAccordionItem-anchor").first
                 # The anchor's inner_text() includes offscreen a11y text
                 # after the visible name ("Week 1: Spanning en Rek\n module:
@@ -410,7 +439,7 @@ class BrightspaceClient:
                 # get_course_discussions' posts count.
                 name = anchor.inner_text().split("\n")[0].strip() if anchor.count() else None
                 if name:
-                    results.append({"module_id": m.group(1) if m else None, "name": name})
+                    results.append({"module_id": module_id, "name": name})
             return results
         finally:
             context.close()
@@ -461,7 +490,7 @@ class BrightspaceClient:
         finally:
             context.close()
 
-    def get_module_content(self, org_unit_id: str, module_name: str) -> list[dict] | None:
+    def get_module_content(self, org_unit_id: str, module_name: str, dedupe: bool = True) -> list[dict] | None:
         """Like get_course_content, but scoped to one specific top-level
         module (matched the same way as get_module_description - see its
         docstring for why clicking is unavoidable here) and - unlike
@@ -498,22 +527,28 @@ class BrightspaceClient:
         `:scope > ul > li.d2l-le-TreeAccordionItem` isolates exactly one
         level at a time instead.
 
-        **Known ambiguity, deliberately not papered over**: for a module
-        that has ONLY sub-folders and no items of its own (confirmed live
-        - Sterkteleer's "Week 1" module itself), clicking it doesn't show
-        an empty/distinct "module root" view - it shows its first
-        sub-folder's content instead, which this then records with
-        `folder_path: []` as if it belonged directly to the module, even
-        though it's really a duplicate of that first sub-folder's own
-        entries. Separately, a folder that has BOTH its own items AND a
-        sub-folder (confirmed live - "College 2 Rek, Staven, Superpositie")
-        showed a mix that partially, but not fully, overlapped with its
-        sub-folder's own listing - which could be the same UI-default
-        behavior, or could be genuinely intentional (D2L lets the same
-        file be linked into multiple locations). Couldn't distinguish
-        the two live, so: don't treat `folder_path: []` results as
-        authoritative "this is definitely only here" without checking
-        for near-duplicate entries deeper in the same result list.
+        **dedupe=True (the default)**: a folder that has sub-folders
+        doesn't reliably show a distinct "just this folder's own items"
+        view when clicked - confirmed live it can instead show a mix that
+        includes some or all of a sub-folder's own items too (e.g.
+        Sterkteleer's "Week 1" module showed exactly its first
+        sub-folder's content; "College 1 Spanning" showed its 3 own items
+        PLUS all 3 of its "Werkcollege 1" sub-folder's items merged
+        together). Root cause not fully pinned down (could be a stale
+        selection carried over from the click sequence, could be D2L
+        deliberately flattening nested content into parent views) - but
+        the *pattern* is consistent and testable: when the exact same
+        topic_id shows up at more than one depth within the same branch,
+        it's always at a shallower folder_path AND a deeper one together,
+        never at two unrelated branches. With dedupe on, this keeps only
+        the deepest (most specific) occurrence of each topic_id and drops
+        the shallower one(s) - a heuristic, not a proven-correct
+        interpretation of which occurrence is the "real" one, but it
+        turns a confusing near-duplicate list into a clean one for the
+        common case. Pass dedupe=False to get the complete, unfiltered
+        data instead (useful if you want to inspect the raw overlap
+        yourself, or if your course structure doesn't match the pattern
+        above).
 
         Returns None if no module matched module_name."""
         base_url = self._base_url()
@@ -537,9 +572,69 @@ class BrightspaceClient:
 
             results = []
             self._collect_content_items(page, base_url, target_item, folder_path=[], results=results, depth=0)
+            if dedupe:
+                results = self._dedupe_by_deepest_folder(results)
             return results
         finally:
             context.close()
+
+    @staticmethod
+    def _dedupe_by_deepest_folder(items: list[dict]) -> list[dict]:
+        """For each topic_id, keeps only the occurrence(s) at the
+        greatest folder_path depth, dropping shallower duplicates. If
+        multiple occurrences tie for the deepest depth (genuinely
+        different branches, not the same ancestor/descendant chain),
+        all of them are kept - this only removes shallower entries that
+        have a same-topic_id match somewhere deeper, it never removes
+        the only copy of anything. See get_module_content's own
+        docstring for why this heuristic exists and its limits."""
+        by_topic: dict[str, list[dict]] = {}
+        for item in items:
+            key = item.get("topic_id") or f"__no_id__{id(item)}"  # items without a topic_id are never deduped against each other
+            by_topic.setdefault(key, []).append(item)
+
+        deduped = []
+        for key, group in by_topic.items():
+            if key.startswith("__no_id__") or len(group) == 1:
+                deduped.extend(group)
+                continue
+            max_depth = max(len(g["folder_path"]) for g in group)
+            deduped.extend(g for g in group if len(g["folder_path"]) == max_depth)
+        return deduped
+
+    def get_all_course_content(self, org_unit_id: str, dedupe: bool = True) -> list[dict]:
+        """The real fix for get_course_content's documented "only sees
+        whichever module happens to be selected" limitation: walks EVERY
+        top-level module (via get_course_modules - navigation tabs like
+        "Bookmarks" excluded by that method's own default) and each
+        module's full nested subtree (via get_module_content), and
+        aggregates everything into one flat list. This is a genuine
+        "show me the entire course" call, not a workaround.
+
+        The real cost: one full page load + click sequence per
+        module/sub-folder in the whole course, not the single page load
+        get_course_content() uses - for a course with many modules and
+        deep nesting this can take a while (tens of seconds to a few
+        minutes, roughly linear in the number of modules/folders). Use
+        get_module_content() directly instead if you already know which
+        module you need - this is for when you genuinely need the whole
+        course.
+
+        Each item gets a `module` field (which top-level module it came
+        from) in addition to `folder_path` (its location within that
+        module - see get_module_content's docstring). `dedupe` is passed
+        straight through to each get_module_content() call - see that
+        method's docstring for what it does and why it defaults on."""
+        modules = self.get_course_modules(org_unit_id)
+        all_items = []
+        for module in modules:
+            items = self.get_module_content(org_unit_id, module["name"], dedupe=dedupe)
+            if items is None:
+                continue
+            for item in items:
+                item["module"] = module["name"]
+                all_items.append(item)
+        return all_items
 
     def _collect_content_items(self, page, base_url, tree_item, folder_path, results, depth, max_depth=6):
         anchor = tree_item.locator("a.d2l-le-TreeAccordionItem-anchor").first
@@ -597,11 +692,18 @@ class BrightspaceClient:
           particular external tool needs its own authentication beyond
           whatever the Brightspace session covers.
 
-        Because of that second case, treat the returned `url`/`title` as
-        "wherever the button's own navigation ended up", not a guaranteed
-        final content URL - this doesn't try to detect "did I land on a
-        login page" automatically, that signal isn't reliable enough
-        across arbitrary external tools/institutions to hardcode."""
+        Because of that second case, treat `url`/`title` as "wherever the
+        button's own navigation ended up", not a guaranteed final content
+        URL. `likely_requires_separate_login` is a best-effort heuristic
+        (checked against the real TU Delft/SURFconext login page from the
+        second case above, but not against a broad sample of other
+        institutions' SSO pages) - True if the landing URL/title matches
+        common login-page patterns (a `login.`/`sso.`/`auth.` subdomain,
+        or "log in"/"sign in"/"inloggen" in the title), False otherwise.
+        It's a hint to check manually, not a guarantee either way - a
+        genuine content page could coincidentally match, and an
+        unfamiliar institution's login page might not match any of these
+        patterns at all."""
         base_url = self._base_url()
         context, page = self._new_page()
         try:
@@ -622,9 +724,13 @@ class BrightspaceClient:
                 new_page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
                 pass  # some destinations keep a long-lived connection open (streaming, polling) - report wherever it got to rather than hang
-            result = {"url": new_page.url, "title": new_page.title()}
+            landed_url, landed_title = new_page.url, new_page.title()
             new_page.close()
-            return result
+            return {
+                "url": landed_url,
+                "title": landed_title,
+                "likely_requires_separate_login": _looks_like_login_page(landed_url, landed_title),
+            }
         finally:
             context.close()
 

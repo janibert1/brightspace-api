@@ -108,8 +108,8 @@ async def download_course_file(org_unit_id: str, topic_id: str):
 
 
 @app.get("/api/courses/{org_unit_id}/modules")
-async def get_course_modules(org_unit_id: str):
-    return await _run(BrightspaceClient.get_course_modules, org_unit_id)
+async def get_course_modules(org_unit_id: str, include_navigation_tabs: bool = False):
+    return await _run(BrightspaceClient.get_course_modules, org_unit_id, include_navigation_tabs)
 
 
 @app.get("/api/courses/{org_unit_id}/modules/description")
@@ -123,12 +123,20 @@ async def get_module_description(org_unit_id: str, name: str):
 
 
 @app.get("/api/courses/{org_unit_id}/modules/content")
-async def get_module_content(org_unit_id: str, name: str):
+async def get_module_content(org_unit_id: str, name: str, dedupe: bool = True):
     """`name` as a query param, same reason as modules/description above."""
-    result = await _run(BrightspaceClient.get_module_content, org_unit_id, name)
+    result = await _run(BrightspaceClient.get_module_content, org_unit_id, name, dedupe)
     if result is None:
         raise HTTPException(404, f"No module matching {name!r} found in this course's content tree.")
     return result
+
+
+@app.get("/api/courses/{org_unit_id}/content/all")
+async def get_all_course_content(org_unit_id: str, dedupe: bool = True):
+    """Slow - see BrightspaceClient.get_all_course_content's docstring.
+    One full request per module/sub-folder in the course, not a single
+    quick call."""
+    return await _run(BrightspaceClient.get_all_course_content, org_unit_id, dedupe)
 
 
 @app.get("/api/courses/{org_unit_id}/content/{topic_id}/external-link")

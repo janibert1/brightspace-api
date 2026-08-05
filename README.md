@@ -13,6 +13,9 @@ of this data. This logs in once as a real browser (so it goes through
 whatever SSO/MFA your institution requires, exactly like a human would),
 saves the session, and reuses it headlessly for every call after that.
 
+See `CHANGELOG.md` for what changed and when — every entry there reflects
+something confirmed live against a real account, not a guess.
+
 ## Install
 
 ```bash
@@ -54,6 +57,34 @@ brightspace-login-scripted     # fully automated - see below
 brightspace-serve              # runs the optional HTTP server on :8000
 ```
 
+### A few more real examples
+
+```python
+with BrightspaceClient() as client:
+    # A specific week's own description text (e.g. "Leerdoelen" blocks) -
+    # the Content tree has no per-module URL, so this actually clicks
+    # into the named module to load it.
+    week = client.get_module_description("775932", "Week 1: Spanning en Rek")
+    print(week["description_html"])
+
+    # Everything under that module, including nested sub-folders -
+    # get_course_content() alone would only see whichever one folder
+    # happens to already be selected.
+    for item in client.get_module_content("775932", "Week 1: Spanning en Rek"):
+        print(item["folder_path"], item["title"])
+
+    # Resolve an "External Resource"/"External Learning Tool" topic's
+    # real destination (its "Open in New Window" button has no static
+    # href - Brightspace resolves it via JS at click time).
+    link = client.get_external_link("775932", "4630702")
+    print(link["url"], "needs its own login?" , link["likely_requires_separate_login"])
+
+    # The homepage's "Update alerts" bell - a cross-course feed of
+    # announcements and grade updates.
+    for n in client.get_notifications():
+        print(n["type"], n["course"], n["title"])
+```
+
 ## What it gives you
 
 Every one of these exists as both a `BrightspaceClient` method and (with
@@ -63,11 +94,12 @@ the `[server]` extra installed) an HTTP endpoint on the same shape:
 |---|---|---|
 | `get_courses()` | `/api/courses` | Your enrolled/visible courses (org unit id + name) |
 | `get_course_content(ou)` | `/api/courses/{ou}/content` | Files/topics in a course's Content area (see caveat below) |
-| `get_course_modules(ou)` | `/api/courses/{ou}/modules` | Top-level module names/ids in a course's Content tree |
+| `get_course_modules(ou)` | `/api/courses/{ou}/modules` | Top-level module names/ids in a course's Content tree (navigation tabs excluded by default) |
 | `get_module_description(ou, name)` | `/api/courses/{ou}/modules/description?name=` | A specific module's own description/overview text (e.g. weekly "Leerdoelen" blocks) |
-| `get_module_content(ou, name)` | `/api/courses/{ou}/modules/content?name=` | Everything under a module, **including nested sub-folders** — see caveat below |
+| `get_module_content(ou, name, dedupe=True)` | `/api/courses/{ou}/modules/content?name=` | Everything under a module, **including nested sub-folders**, deduplicated by default — see caveat below |
+| `get_all_course_content(ou, dedupe=True)` | `/api/courses/{ou}/content/all` | Every module's full content, aggregated — genuinely "show me the whole course" (slow, see caveat below) |
 | `download_course_file(ou, topic_id)` | `/api/courses/{ou}/download/{topic_id}` | Downloads a content file (PDF-backed topics only so far) |
-| `get_external_link(ou, topic_id)` | `/api/courses/{ou}/content/{topic_id}/external-link` | Resolves an "External Resource"/"External Learning Tool" topic's real destination URL |
+| `get_external_link(ou, topic_id)` | `/api/courses/{ou}/content/{topic_id}/external-link` | Resolves an "External Resource"/"External Learning Tool" topic's real destination URL, plus a best-effort "did this need a separate login" flag |
 | `get_course_grades(ou)` | `/api/courses/{ou}/grades` | Grade items + scores + written feedback |
 | `get_course_assignments(ou)` | `/api/courses/{ou}/assignments` | Assignment/Dropbox folders: due dates, submission status, score, feedback link |
 | `get_course_discussions(ou)` | `/api/courses/{ou}/discussions` | Forum topics per course: thread/post counts, unread flag |
@@ -179,56 +211,61 @@ All via `.env` (in the current working directory by default — set
 
 ## Known limitations
 
-- **Content listing isn't a stable "show everything" view.** Brightspace
-  remembers, server-side, per-user-per-course, whichever module you last
-  had open in the Content tool, and only shows that module's items on a
-  plain page load. A never-before-visited course tends to show a
-  reasonably full listing; one you've already browsed into a specific
-  module for will only show that module until a real browser session
-  navigates elsewhere. For a course with many modules, the reliable way
-  to see everything is a real interactive session (browse Content
-  yourself once to find topic IDs across all modules), then use
-  `download_course_file` with those IDs directly — or use
-  `get_module_content()` instead, which walks a specific module's full
-  subtree (including nested sub-folders) rather than relying on whatever
-  happens to already be selected.
-- **`get_module_content()`'s folder-level results have a known
-  ambiguity.** A module/folder that has ONLY sub-folders and no items of
-  its own shows its first sub-folder's content instead of an empty view
-  when clicked (confirmed live) — recorded with `folder_path: []` even
-  though it's really a duplicate of that sub-folder's own entries. A
-  folder with BOTH its own items and a sub-folder showed a *partial*
-  overlap with the sub-folder's listing, which could be the same
-  artifact or genuinely intentional (D2L allows linking the same file
-  into multiple locations) — this wasn't distinguishable live. Don't
-  treat `folder_path: []` results as authoritative without checking for
-  near-duplicates deeper in the same result list.
-- **External link resolution isn't guaranteed to reach real content.**
-  `get_external_link()` clicks the topic's own "Open in New Window"
-  button and reports wherever the resulting tab lands — confirmed live
-  this sometimes IS the real destination (an LTI-launched tool,
-  authenticated via the existing Brightspace session with no extra
-  login) and sometimes ISN'T (a plain external link to a service with
-  its own separate SSO, landing on that service's login page instead).
-  This doesn't try to detect which case occurred.
-- **Quizzes and Calendar are not implemented.** Quizzes: no course this
-  was tested against had any quiz data to build a real parser against —
-  don't guess at a DOM you haven't seen populated, dump the page and
-  build against that if you have real data. Calendar is a month-grid
-  widget, not a list — real event data means clicking through day cells
-  and waiting for async popovers per day, a much bigger scrape than
-  everything else here; `get_deadlines()` already covers "what's due
-  soon" in a real list format.
-- **`enroll()` is an unimplemented stub.** Exists as a shape to fill in,
-  not working code. `upload()` IS implemented — see the table above and
-  its own docstring for the `confirm_submit` safety default.
-- **Notification/module tree quirks worth knowing**: the D2L homepage has
-  two different bell icons (`get_notifications()` uses the "Update
-  alerts" one, not "Subscription alerts" — they're genuinely different
-  feeds); `get_course_modules()` includes a few fixed navigational tabs
-  (Overview, Bookmarks, Course Schedule, Table of Contents) alongside
-  real content modules, since they live in the same tree with no
-  distinguishing marker beyond a missing `module_id`.
+Fixed where a real fix was possible; the rest are documented honestly
+rather than guessed at. See `CHANGELOG.md` for exactly when/how each fix
+landed.
+
+**Fixed:**
+
+- ~~Content listing isn't a stable "show everything" view~~ — fixed by
+  `get_module_content()` (one module's full nested subtree) and
+  `get_all_course_content()` (the whole course, every module). Plain
+  `get_course_content()` still only reflects whichever module happens to
+  already be selected — kept as-is since it's the fast/cheap option when
+  that's all you need; reach for the other two when you actually need
+  completeness.
+- ~~`get_module_content()`'s near-duplicate folder-level results~~ —
+  `dedupe=True` (the default) now collapses same-topic_id entries down to
+  their deepest occurrence. This is a heuristic, not a proven-correct
+  interpretation of D2L's own behavior (see the method's docstring for
+  the actual evidence behind it) — pass `dedupe=False` for the raw,
+  unfiltered data if you want to judge for yourself.
+- ~~`get_external_link()` doesn't say whether it actually reached real
+  content~~ — now returns a best-effort `likely_requires_separate_login`
+  flag (checked against real login-page patterns: `login.`/`sso.`/`auth.`
+  subdomains, "log in"/"sign in"/"inloggen" in the title). Only verified
+  against one real institution's SSO page, so treat it as a hint to
+  check manually, not a certainty either way.
+- ~~`get_course_modules()` mixes real modules with fixed UI tabs~~ — now
+  excludes "Overview"/"Bookmarks"/"Course Schedule"/"Table of Contents"
+  by default (they never have a real `module_id`). Pass
+  `include_navigation_tabs=True` for the old behavior back.
+
+**Not fixed (genuinely not fixable right now, not just left undone):**
+
+- **Quizzes are not implemented.** Re-checked against all 16 org units
+  this account has access to (not just a sample) — zero quiz data
+  anywhere to build or verify a parser against. Don't guess at a DOM
+  nobody's ever seen populated; if you have a course that actually uses
+  D2L's Quizzes tool, dump the page HTML and build against that for real.
+- **Calendar is not implemented.** A month-grid widget, not a list — real
+  event data means clicking through day cells and waiting for async
+  popovers per day, a much bigger scrape than everything else here.
+  `get_deadlines()` already covers "what's due soon" in a real list
+  format; Calendar would mostly add exam dates and other longer-horizon
+  events, not attempted.
+- **`enroll()` is an unimplemented stub.** Enrolling in a real course is
+  itself a real, consequential action — can't safely build and verify
+  this against a live account without genuinely intending to enroll in
+  something, unlike everything else here which is either read-only or
+  (for `upload()`) has a safe default. Exists as a shape to fill in, not
+  working code.
+
+**Structural, not really "limitations" to fix:**
+
+- The D2L homepage has two different bell icons —
+  `get_notifications()` uses "Update alerts", not "Subscription alerts"
+  (genuinely different feeds, confirmed live).
 - **Threading, if you use the HTTP server**: `BrightspaceClient` uses
   Playwright's synchronous API, which must run on the same OS thread it
   was started on. `server.py` handles this internally (a dedicated
