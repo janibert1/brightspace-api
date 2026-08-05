@@ -33,5 +33,15 @@ class Config:
                 "(e.g. https://brightspace.tudelft.nl, or your own institution's D2L domain)."
             )
 
+        # Only needed for scripts/scripted_login.py (fully automated login) -
+        # scripts/bootstrap_login.py (interactive) doesn't need these at all.
+        self.brightspace_username = env.get("BRIGHTSPACE_USERNAME", "")
+        self.brightspace_password = env.get("BRIGHTSPACE_PASSWORD", "")
+        # Optional: a shell command that prints a one-time verification code
+        # to stdout, for the (unverified - see browser_session.py) email-code
+        # fallback in scripted_login. Leave unset to skip that fallback
+        # entirely and just fail loudly if a step-up challenge appears.
+        self.email_code_check_command = env.get("EMAIL_CODE_CHECK_COMMAND", "")
+
 
 cfg = Config()

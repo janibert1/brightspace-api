@@ -53,6 +53,39 @@ The bootstrap step needs a real display (a desktop session, or `ssh -X`,
 or a VNC session on a headless box) — there's no way around this for a
 real institutional login, and this project doesn't try to fake one.
 
+### Fully automated login (no display, no human)
+
+If *your* institution's Brightspace login doesn't itself require MFA —
+confirmed true for TU Delft: logging into Brightspace goes straight
+through with no challenge, MFA only guards Microsoft 365/Outlook there,
+not D2L — you can skip the interactive step entirely:
+
+```bash
+# in .env: set BRIGHTSPACE_USERNAME and BRIGHTSPACE_PASSWORD
+.venv/bin/python scripts/scripted_login.py
+```
+
+This drives the real TU Delft login form (`#username`/`#password`/
+`#submit_button`) headlessly and saves the session, same as the
+interactive flow. Safe to run from cron to refresh the session
+periodically. If your institution's login *does* require MFA, or uses a
+different identity provider than TU Delft's, this will detect that it
+didn't land back on Brightspace and raise a clear error (with the
+unexpected page saved to disk) rather than hang or guess — fall back to
+`bootstrap_login.py` in that case, and if you want to adapt
+`scripted_login` to your own institution, start from that saved page and
+adjust the selectors in `browser_session.py`.
+
+There's a pluggable, optional fallback (`EMAIL_CODE_CHECK_COMMAND` in
+`.env`) for institutions where login *does* step up to an emailed
+one-time code specifically — point it at any command that prints the
+code to stdout (an IMAP one-liner, your own inbox-checking script,
+whatever you already have). This project has no built-in email client
+and doesn't assume you have one; leave it unset to just fail loudly
+instead. This fallback has not been exercised against a real challenge
+page (TU Delft's Brightspace login has none to test against) — treat it
+as a reasonable starting point, not a verified feature.
+
 ## Session lifetime (read this before relying on it)
 
 Brightspace's own idle-timeout dialog states sessions expire after **180
