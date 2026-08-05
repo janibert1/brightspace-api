@@ -1,4 +1,0 @@
-fastapi>=0.141
-uvicorn>=0.52
-playwright>=1.62
-pydantic>=2.13

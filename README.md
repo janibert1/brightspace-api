@@ -1,83 +1,131 @@
 # brightspace-api
 
-A local FastAPI wrapper around a persistent Playwright browser session for
-Brightspace (D2L). Built against TU Delft's install, but the pages it
-scrapes are D2L's own stock templates rather than TU Delft-specific
-customizations, so it likely works against other Brightspace/D2L
-institutions with little or no change — not verified elsewhere yet, so
-treat that as a reasonable bet rather than a guarantee.
+A Python client (plus an optional local HTTP server) for Brightspace
+(D2L), backed by a persistent Playwright browser session. Built against
+TU Delft's install, but the pages it scrapes are D2L's own stock
+templates rather than TU Delft-specific customizations, so it likely
+works against other Brightspace/D2L institutions with little or no
+change — not verified elsewhere yet, so treat that as a reasonable bet
+rather than a guarantee.
 
-Why this exists: Brightspace has no public student-facing API for most of
-this data. This logs in once as a real browser (so it goes through
+Why this exists: Brightspace has no public student-facing API for most
+of this data. This logs in once as a real browser (so it goes through
 whatever SSO/MFA your institution requires, exactly like a human would),
-saves the session, and reuses it headlessly for every request after that.
+saves the session, and reuses it headlessly for every call after that.
+
+## Install
+
+```bash
+pip install .                    # from a checkout of this repo
+# or, editable, for development:
+pip install -e .
+playwright install chromium
+
+# only if you also want the local HTTP server:
+pip install ".[server]"
+```
+
+## Quick start
+
+```bash
+cp .env.example .env
+# edit .env - set BRIGHTSPACE_BASE_URL to your institution's Brightspace domain
+```
+
+```python
+from brightspace_api import bootstrap_login_interactive, BrightspaceClient
+
+bootstrap_login_interactive()  # opens a real browser window, log in yourself once
+
+with BrightspaceClient() as client:
+    for course in client.get_courses():
+        print(course["org_unit_id"], course["name"])
+
+    for a in client.get_course_assignments(course["org_unit_id"]):
+        print(a["name"], a["due"], a["score"])
+```
+
+Or via the console scripts (installed with the package, no `python -c`
+needed):
+
+```bash
+brightspace-login              # interactive, needs a real display
+brightspace-login-scripted     # fully automated - see below
+brightspace-serve              # runs the optional HTTP server on :8000
+```
 
 ## What it gives you
 
-| Endpoint | What it returns |
-|---|---|
-| `GET /api/courses` | Your enrolled/visible courses (org unit id + name) |
-| `GET /api/courses/{ou}/content` | Files/topics in a course's Content area (see caveat below) |
-| `GET /api/courses/{ou}/content/{topic_id}` *(download)* | Downloads a content file (PDF-backed topics only so far) |
-| `GET /api/courses/{ou}/grades` | Grade items + scores + written feedback |
-| `GET /api/courses/{ou}/assignments` | Assignment/Dropbox folders: due dates, submission status, score, feedback link |
-| `GET /api/courses/{ou}/discussions` | Forum topics per course: thread/post counts, unread flag |
-| `GET /api/announcements` | Recent announcements across your courses |
-| `GET /api/deadlines` | The "Work To Do" widget — what's currently pending |
-| `GET /healthz` | `{"status": "ok", "session_loaded": true/false}` |
-| `POST /api/enroll`, `POST /api/upload` | Stubs, not implemented — see `main.py`, selectors need to be filled in against your own install before these do anything real |
+Every one of these exists as both a `BrightspaceClient` method and (with
+the `[server]` extra installed) an HTTP endpoint on the same shape:
 
-Every endpoint's real DOM shape (what was actually found live, not
-guessed) is documented in a comment directly above it in `main.py` — read
-those before extending anything, they explain *why* each selector is
-what it is.
+| `BrightspaceClient` method | `GET`/`POST` | What it returns |
+|---|---|---|
+| `get_courses()` | `/api/courses` | Your enrolled/visible courses (org unit id + name) |
+| `get_course_content(ou)` | `/api/courses/{ou}/content` | Files/topics in a course's Content area (see caveat below) |
+| `download_course_file(ou, topic_id)` | `/api/courses/{ou}/download/{topic_id}` | Downloads a content file (PDF-backed topics only so far) |
+| `get_course_grades(ou)` | `/api/courses/{ou}/grades` | Grade items + scores + written feedback |
+| `get_course_assignments(ou)` | `/api/courses/{ou}/assignments` | Assignment/Dropbox folders: due dates, submission status, score, feedback link |
+| `get_course_discussions(ou)` | `/api/courses/{ou}/discussions` | Forum topics per course: thread/post counts, unread flag |
+| `get_announcements()` | `/api/announcements` | Recent announcements across your courses |
+| `get_deadlines()` | `/api/deadlines` | The "Work To Do" widget — what's currently pending |
+| `enroll(course_codes)` | `/api/enroll` | Stub, not implemented |
+| `upload(assignment_url, file_path)` | `/api/upload` | Stub, not implemented |
+| — | `/healthz` | `{"status": "ok", "session_loaded": true/false}` (server only) |
 
-## Setup
+Every method's real DOM shape (what was actually found live, not
+guessed) is documented in its own docstring in `client.py` — read those
+before extending anything, they explain *why* each selector is what it
+is.
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/playwright install chromium
+`enroll`/`upload` are shape-only stubs — Brightspace's real enrollment
+and dropbox-submission UIs need their selectors confirmed live against
+your own institution before these do anything real. Neither has a
+built-in approval/confirmation check; if you implement them, add your
+own gate before calling them for real, and don't expose the HTTP server
+beyond localhost without one either.
 
-cp .env.example .env
-# edit .env - set BRIGHTSPACE_BASE_URL to your institution's Brightspace domain
+## Login
 
-.venv/bin/python scripts/bootstrap_login.py
-# opens a real browser window - log in yourself (including MFA if prompted),
-# press Enter in the terminal once you're logged in, session gets saved
+### Interactive (any institution)
 
-.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+```python
+from brightspace_api import bootstrap_login_interactive
+bootstrap_login_interactive()
 ```
 
-The bootstrap step needs a real display (a desktop session, or `ssh -X`,
-or a VNC session on a headless box) — there's no way around this for a
-real institutional login, and this project doesn't try to fake one.
+Opens a real headed browser window, you log in yourself (including
+MFA/CAPTCHA, whatever your institution requires), then the session gets
+saved. Needs a real display (a desktop session, `ssh -X`, or a VNC
+session on a headless box) — there's no way around this for a real
+institutional login, and this project doesn't try to fake one.
 
-### Fully automated login (no display, no human)
+### Fully automated (no display, no human)
+
+```python
+# in .env: set BRIGHTSPACE_USERNAME and BRIGHTSPACE_PASSWORD
+from brightspace_api import bootstrap_login_scripted
+bootstrap_login_scripted()
+```
 
 If *your* institution's Brightspace login doesn't itself require MFA —
 confirmed true for TU Delft: logging into Brightspace goes straight
 through with no challenge, MFA only guards Microsoft 365/Outlook there,
-not D2L — you can skip the interactive step entirely:
+not D2L — this drives the real login form headlessly and saves the
+session, same result as the interactive flow. Safe to run from cron to
+refresh the session periodically.
 
-```bash
-# in .env: set BRIGHTSPACE_USERNAME and BRIGHTSPACE_PASSWORD
-.venv/bin/python scripts/scripted_login.py
-```
+The form selectors are confirmed live against TU Delft's
+`login.tudelft.nl` (a SimpleSAMLphp login page). If your institution
+uses a different identity provider, this will detect that it didn't land
+back on Brightspace and raise a clear error (with the unexpected page
+saved to disk) rather than hang or guess — fall back to the interactive
+login in that case, and if you want to adapt this to your own
+institution, start from that saved page and adjust the selectors in
+`session.py`.
 
-This drives the real TU Delft login form (`#username`/`#password`/
-`#submit_button`) headlessly and saves the session, same as the
-interactive flow. Safe to run from cron to refresh the session
-periodically. If your institution's login *does* require MFA, or uses a
-different identity provider than TU Delft's, this will detect that it
-didn't land back on Brightspace and raise a clear error (with the
-unexpected page saved to disk) rather than hang or guess — fall back to
-`bootstrap_login.py` in that case, and if you want to adapt
-`scripted_login` to your own institution, start from that saved page and
-adjust the selectors in `browser_session.py`.
-
-There's a pluggable, optional fallback (`EMAIL_CODE_CHECK_COMMAND` in
-`.env`) for institutions where login *does* step up to an emailed
+There's also a pluggable, optional fallback (`EMAIL_CODE_CHECK_COMMAND`
+in `.env`) for institutions where login *does* step up to an emailed
 one-time code specifically — point it at any command that prints the
 code to stdout (an IMAP one-liner, your own inbox-checking script,
 whatever you already have). This project has no built-in email client
@@ -96,16 +144,29 @@ SSO session cookie, the identity-provider auth token) are browser
 actual lifetime is fully server-side and not visible from the cookie
 file itself.
 
-Practical takeaway: if something hits Brightspace at least once every
+Practical takeaway: if something uses the client at least once every
 couple of hours, the session should keep renewing itself indefinitely. A
 longer gap (going quiet overnight, say) risks the session having expired
-by the time you next use it, at which point you'll need to re-run
-`scripts/bootstrap_login.py` by hand. There's no CAPTCHA on this login
-flow (at least on the TU Delft install) — only real institutional
-MFA — so a scripted *keepalive* (a cheap periodic request to keep the
-idle timer from firing) is plausible future work if the 3-hour window
-turns out to be a real problem in practice; a scripted *re-login* past
-MFA is not, and this project doesn't attempt it.
+by the time you next use it, at which point `BrightspaceClient.start()`
+will raise (`BrightspaceError: No saved Brightspace session`) — re-run
+`bootstrap_login_interactive()` or `bootstrap_login_scripted()` and carry
+on.
+
+## Configuration
+
+All via `.env` (in the current working directory by default — set
+`BRIGHTSPACE_ENV_FILE` to point elsewhere) or real environment variables
+(which always win). See `.env.example` for the full list:
+
+- `BRIGHTSPACE_BASE_URL` — required.
+- `BRIGHTSPACE_USERNAME` / `BRIGHTSPACE_PASSWORD` — only for the
+  automated login.
+- `EMAIL_CODE_CHECK_COMMAND` — optional, see above.
+- `BRIGHTSPACE_STORAGE_STATE_FILE` / `BRIGHTSPACE_DOWNLOADS_DIR` —
+  override where the session and downloaded files live. Default to
+  `~/.brightspace-api/`. Point multiple installs/services at the same
+  path to share one already-logged-in session instead of each doing its
+  own login.
 
 ## Known limitations
 
@@ -117,20 +178,22 @@ MFA is not, and this project doesn't attempt it.
   module for will only show that module until a real browser session
   navigates elsewhere. For a course with many modules, the reliable way
   to see everything is a real interactive session (browse Content
-  yourself once to find topic IDs across all modules), then use the
-  download endpoint with those IDs directly.
+  yourself once to find topic IDs across all modules), then use
+  `download_course_file` with those IDs directly.
 - **Quizzes and Calendar are not implemented.** Quizzes: no course this
   was tested against had any quiz data to build a real parser against —
   don't guess at a DOM you haven't seen populated, dump the page and
   build against that if you have real data. Calendar is a month-grid
   widget, not a list — real event data means clicking through day cells
   and waiting for async popovers per day, a much bigger scrape than
-  everything else here; `/api/deadlines` already covers "what's due
+  everything else here; `get_deadlines()` already covers "what's due
   soon" in a real list format.
-- **`/api/enroll` and `/api/upload` are unimplemented stubs.** They exist
-  as a shape to fill in, not working code — Brightspace's real
-  enrollment and dropbox-submission UIs need their selectors confirmed
-  live before these do anything.
-- No built-in write-safety/approval gate on the two write-ish endpoints
-  above — don't expose this service beyond localhost without adding your
-  own confirmation step in front of them.
+- **`enroll()` and `upload()` are unimplemented stubs.** They exist as a
+  shape to fill in, not working code.
+- **Threading, if you use the HTTP server**: `BrightspaceClient` uses
+  Playwright's synchronous API, which must run on the same OS thread it
+  was started on. `server.py` handles this internally (a dedicated
+  single-worker thread pool) — if you build your own server or
+  multi-threaded wrapper around `BrightspaceClient` directly, keep that
+  constraint in mind rather than calling one instance from multiple
+  threads.
