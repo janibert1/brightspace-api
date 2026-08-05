@@ -101,6 +101,24 @@ and invisible from the cookie jar. Practical read: as long as something
 uses this client at least once every couple hours, the session likely
 survives indefinitely; a longer gap risks needing a fresh login (see
 session.py).
+
+2026-08-05, added get_course_modules/get_module_description,
+get_notifications, and a real upload(). See each method's own docstring
+for the full detail. Short version:
+- Module description text (e.g. a course's weekly "Leerdoelen" blocks)
+  lives on a JS-driven tree with no per-module URL - loading a specific
+  module's text means actually clicking it (confirmed live), there's no
+  link to construct directly.
+- The homepage has TWO different bell icons ("Subscription alerts" and
+  "Update alerts", confirmed live via their distinct aria-labels) -
+  get_notifications() is the second one, the general cross-course
+  activity feed. Only its first page (5 items) is read; older items sit
+  behind a real "Load More" pager, not walked here.
+- upload() is real (confirmed live end-to-end through staging a file),
+  but its final step - actually clicking Submit - was deliberately never
+  exercised against a live assignment (real, hard-to-reverse academic
+  action) and defaults off (`confirm_submit=False`). See upload()'s own
+  docstring before turning that on for real.
 """
 import re
 import urllib.parse
@@ -340,6 +358,87 @@ class BrightspaceClient:
                     "url": f"{base_url}{href}" if href and href.startswith("/") else href,
                 })
             return results
+        finally:
+            context.close()
+
+    def get_course_modules(self, org_unit_id: str) -> list[dict]:
+        """Lists the top-level module tree entries in a course's Content
+        area (id + name) - e.g. "Week 1: Spanning en Rek". Use `name`
+        with get_module_description() to load that specific module's own
+        description/overview text. Doesn't descend into sub-modules (a
+        module nested inside another doesn't get its own entry here).
+        The tree itself is JS-driven (see get_module_description's
+        docstring for why that matters), but listing the top-level names
+        doesn't require clicking anything - only loading one specific
+        module's description text does."""
+        base_url = self._base_url()
+        context, page = self._new_page()
+        try:
+            page.goto(f"{base_url}/d2l/le/content/{org_unit_id}/Home", wait_until="networkidle")
+            page.wait_for_timeout(2000)
+            items = page.locator("li.d2l-le-TreeAccordionItem-Root")
+            results = []
+            for i in range(items.count()):
+                item = items.nth(i)
+                data_key = item.get_attribute("data-key") or ""
+                m = re.search(r"ModuleCO-(\d+)", data_key)
+                anchor = item.locator("a.d2l-le-TreeAccordionItem-anchor").first
+                # The anchor's inner_text() includes offscreen a11y text
+                # after the visible name ("Week 1: Spanning en Rek\n module:
+                # contains 2 sub-modules\nselected") - the visible name is
+                # always first in DOM order, so the first line is enough,
+                # same pragmatic split-on-newline approach used for
+                # get_course_discussions' posts count.
+                name = anchor.inner_text().split("\n")[0].strip() if anchor.count() else None
+                if name:
+                    results.append({"module_id": m.group(1) if m else None, "name": name})
+            return results
+        finally:
+            context.close()
+
+    def get_module_description(self, org_unit_id: str, module_name: str) -> dict | None:
+        """Loads a specific top-level module's description/overview text
+        (e.g. the weekly "Leerdoelen" blocks TU Delft courses commonly
+        use) from the Content area. Matches `module_name` against the
+        visible tree item text (case-insensitive substring) - use
+        get_course_modules() first if you're not sure of the exact name.
+        Returns None if nothing matched.
+
+        The module tree is JS-driven, not URL-addressable: each item's
+        link is `href="javascript:void(0)"`, triggering an in-page AJAX
+        update that swaps the right-hand panel without changing the URL
+        (confirmed live) - so there's no direct link to construct for "the
+        page for module X", the only way to load a specific module's text
+        is to actually click it, which is what this does.
+
+        Description is returned as raw HTML (`description_html`, same
+        `d2l-html-block` pattern used for announcements/grades feedback
+        elsewhere) - it's whatever rich text the instructor put there,
+        not plain text."""
+        base_url = self._base_url()
+        context, page = self._new_page()
+        try:
+            page.goto(f"{base_url}/d2l/le/content/{org_unit_id}/Home", wait_until="networkidle")
+            page.wait_for_timeout(2000)
+            items = page.locator("li.d2l-le-TreeAccordionItem-Root")
+            target_anchor, matched_name = None, None
+            for i in range(items.count()):
+                item = items.nth(i)
+                anchor = item.locator("a.d2l-le-TreeAccordionItem-anchor").first
+                if anchor.count() == 0:
+                    continue
+                name = anchor.inner_text().split("\n")[0].strip()
+                if module_name.lower() in name.lower():
+                    target_anchor, matched_name = anchor, name
+                    break
+            if target_anchor is None:
+                return None
+
+            target_anchor.click()
+            page.wait_for_timeout(2000)
+            block = page.locator("div.d2l-htmlblock-untrusted d2l-html-block").first
+            description_html = block.get_attribute("html") if block.count() else None
+            return {"name": matched_name, "description_html": description_html}
         finally:
             context.close()
 
@@ -598,6 +697,84 @@ class BrightspaceClient:
             context.close()
 
     # ------------------------------------------------------------------
+    # Notifications
+    # ------------------------------------------------------------------
+
+    def get_notifications(self) -> list[dict]:
+        """The "Update alerts" bell tray on the homepage - a cross-course
+        feed of announcements/grade updates/etc (confirmed live:
+        "Announcement Posted", "Grade Updated" including the actual new
+        grade value in the title, e.g. "...Your grade is: 9,8").
+
+        There are actually TWO bell icons in the D2L top nav, confirmed
+        live by their distinct aria-labels - "Subscription alerts" (forum
+        subscription notifications, was empty when checked) and "Update
+        alerts" (this one, the general activity feed - matches what's
+        commonly just called "the notification bell"). Don't assume
+        `[aria-label*="Alert"]` uniquely identifies the right one; this
+        uses the exact `[aria-label="Update alerts"]` for that reason.
+
+        Backed by a real endpoint
+        (/d2l/NavigationArea/<id>/ActivityFeed/GetAlertsDaylight?Category=1)
+        but its response is D2L's own RPC-ish "while(1);{...}" format with
+        HTML embedded as an escaped string inside JSON, not meaningfully
+        simpler to parse than just clicking the bell and reading the
+        resulting DOM - so this does the latter. Each item comes from a
+        `<li class="d2l-datalist-item">`: title + link from
+        `a.d2l-datalist-item-actioncontrol`, type+course from a
+        `span.d2l-textblock-secondary` (e.g. "Grade Updated - WBMT1051
+        Wiskunde 2 (2025/26 Q3)" - split on the first " - ", since the
+        type values are a small fixed vocabulary that never contains one
+        itself), and the precise timestamp from the date element's own
+        `title` attribute ("Received on Friday, 31 July, 2026 12:07 CET" -
+        more precise than the shortened visible text like "31 July").
+
+        **Only returns the first page** (5 items, confirmed live) - there
+        is a real "Load More" pager for older items, not walked here.
+        This covers "what's new" rather than full notification history."""
+        base_url = self._base_url()
+        context, page = self._new_page()
+        try:
+            page.goto(f"{base_url}/d2l/home", wait_until="networkidle")
+            page.wait_for_timeout(2000)
+            bell = page.locator('[aria-label="Update alerts"]').first
+            if bell.count() == 0:
+                return []
+            bell.click()
+            page.wait_for_timeout(2500)
+
+            items = page.locator("li.d2l-datalist-item")
+            results = []
+            for i in range(items.count()):
+                item = items.nth(i)
+                link = item.locator("a.d2l-datalist-item-actioncontrol").first
+                if link.count() == 0:
+                    continue
+                title = link.inner_text().strip()
+                href = link.get_attribute("href")
+
+                type_course_el = item.locator("span.d2l-textblock-secondary").first
+                type_course_text = type_course_el.inner_text().strip() if type_course_el.count() else ""
+                kind, _, course = type_course_text.partition(" - ")
+
+                date_el = item.locator(".d2l-navigation-area-activity-message-date").first
+                received = None
+                if date_el.count():
+                    raw = date_el.get_attribute("title") or ""
+                    received = raw.removeprefix("Received on ").strip() or None
+
+                results.append({
+                    "type": kind.strip() or None,
+                    "course": course.strip() or None,
+                    "title": title,
+                    "url": f"{base_url}{href}" if href and href.startswith("/") else href,
+                    "received": received,
+                })
+            return results
+        finally:
+            context.close()
+
+    # ------------------------------------------------------------------
     # Write endpoints - unimplemented stubs, see each docstring
     # ------------------------------------------------------------------
 
@@ -614,16 +791,114 @@ class BrightspaceClient:
         finally:
             context.close()
 
-    def upload(self, assignment_url: str, file_path: str) -> dict:
-        """Not implemented - Brightspace's assignment drop-box file input
-        selector needs to be confirmed live for your institution before
-        this does anything real. No built-in confirmation/approval check
-        either."""
+    def upload(self, assignment_url: str, file_paths: list[str] | str, confirm_submit: bool = False) -> dict:
+        """Submits file(s) to a Dropbox/Assignment folder. `assignment_url`
+        is the `folder_submit_files.d2l` URL from get_course_assignments'
+        `feedback_url`-style link (same URL D2L uses whether or not
+        something's already been submitted - it calls this "Submit
+        Assignment" regardless).
+
+        Real DOM flow, confirmed LIVE end-to-end (real file, real
+        TU Delft dropbox) up through staging a file - see the
+        confirm_submit note below for the one part that's NOT been tested
+        live:
+          1. Click the "Add a File" button.
+          2. A file-picker opens in an iframe
+             (`/d2l/common/dialogs/file/main.d2l`) - click its "My
+             Computer" tab (`li:has(a[title="My Computer"])`; the tab's
+             own link text is an offscreen a11y span, not directly
+             clickable, so this targets the visible list item instead).
+          3. Click "Upload" inside that dialog while Playwright's
+             file-chooser listener is armed
+             (`page.expect_file_chooser()`), then hand it the real local
+             file path - this is a genuine native OS file dialog under a
+             real (even if headless) browser, `expect_file_chooser` is
+             the correct way to drive that without a display.
+          4. Once the upload completes, click "Add" on the OUTER dialog
+             wrapper (a *different* frame than steps 2-3 - this button
+             lives on the main page, not inside the file-picker iframe)
+             to confirm the selection and close the dialog. At this
+             point the file is staged in the page's own "Files to
+             submit" list - confirmed live that nothing is actually sent
+             to the course yet.
+          5. Repeat 1-4 for each path in file_paths.
+          6. Only if confirm_submit=True: click the real "Submit" button.
+
+        **confirm_submit defaults to False on purpose, and step 6 itself
+        has never been run live** - clicking Submit is a real,
+        essentially irreversible academic action (a real submission
+        attempt, a real timestamp, can affect grading on a real
+        assignment), so this was deliberately not exercised against a
+        live TU Delft assignment while building it. Steps 1-5 (getting a
+        real file staged and ready) ARE confirmed live. Test confirm_submit=True
+        yourself on something low-stakes before trusting it blindly - if
+        the Submit button's post-click behavior turns out to need
+        different handling (e.g. a real page navigation vs. an in-place
+        AJAX update - unknown which, see the plain `wait_for_timeout`
+        below rather than an assumed `expect_navigation`), that's exactly
+        the kind of thing only a real test will surface.
+
+        Returns {"staged_files": [...], "submitted": bool}."""
         context, page = self._new_page()
         try:
-            page.goto(assignment_url)
-            file_input = page.locator("input[type=file]").first
-            file_input.set_input_files(file_path)
-            return {"status": "NOT_IMPLEMENTED - submit-button click needs the real selector too"}
+            if isinstance(file_paths, str):
+                file_paths = [file_paths]
+
+            page.goto(assignment_url, wait_until="networkidle")
+            page.wait_for_timeout(1500)
+
+            for path in file_paths:
+                add_file_btn = page.locator('button:has-text("Add a File")').first
+                if add_file_btn.count() == 0:
+                    raise BrightspaceError(
+                        "No 'Add a File' button found - assignment_url doesn't look like a real "
+                        "folder_submit_files.d2l page, or the DOM has changed since this was built."
+                    )
+                add_file_btn.click()
+                page.wait_for_timeout(2500)
+
+                dialog_frame = next((f for f in page.frames if "dialogs/file" in f.url), None)
+                if dialog_frame is None:
+                    raise BrightspaceError("File-picker dialog iframe didn't appear after clicking 'Add a File'.")
+
+                my_computer = dialog_frame.locator('li:has(a[title="My Computer"])').first
+                if my_computer.count() == 0:
+                    raise BrightspaceError("'My Computer' tab not found in the file-picker dialog - unexpected shape.")
+                my_computer.click()
+                page.wait_for_timeout(2000)
+                # the frame object above is now stale (its URL changed when
+                # the tab was clicked) - re-fetch it fresh
+                dialog_frame = next((f for f in page.frames if "dialogs/file" in f.url), None)
+
+                upload_btn = dialog_frame.locator('button:has-text("Upload")').first
+                if upload_btn.count() == 0:
+                    raise BrightspaceError("'Upload' button not found in the 'My Computer' panel - unexpected shape.")
+                with page.expect_file_chooser() as fc_info:
+                    upload_btn.click()
+                fc_info.value.set_files(path)
+                page.wait_for_timeout(3000)  # real upload transfer, not instant
+
+                confirm_add = page.locator(
+                    "d2l-dialog button:has-text('Add'), .d2l-dialog button:has-text('Add'), "
+                    "[role=dialog] button:has-text('Add')"
+                ).first
+                if confirm_add.count() == 0:
+                    raise BrightspaceError(
+                        "Outer dialog's 'Add' confirm button not found after upload - file may not be "
+                        "staged. Don't assume it worked."
+                    )
+                confirm_add.click()
+                page.wait_for_timeout(2000)
+
+            submitted = False
+            if confirm_submit:
+                submit_btn = page.locator('button:has-text("Submit")').first
+                if submit_btn.count() == 0:
+                    raise BrightspaceError("No 'Submit' button found after staging files - unexpected page state.")
+                submit_btn.click()
+                page.wait_for_timeout(3000)
+                submitted = True
+
+            return {"staged_files": file_paths, "submitted": submitted}
         finally:
             context.close()

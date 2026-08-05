@@ -107,6 +107,26 @@ async def download_course_file(org_unit_id: str, topic_id: str):
     return FileResponse(str(path), filename=path.name, media_type="application/pdf")
 
 
+@app.get("/api/courses/{org_unit_id}/modules")
+async def get_course_modules(org_unit_id: str):
+    return await _run(BrightspaceClient.get_course_modules, org_unit_id)
+
+
+@app.get("/api/courses/{org_unit_id}/modules/description")
+async def get_module_description(org_unit_id: str, name: str):
+    """`name` as a query param (not a path segment) since module names
+    routinely contain slashes/colons/etc that don't belong in a URL path."""
+    result = await _run(BrightspaceClient.get_module_description, org_unit_id, name)
+    if result is None:
+        raise HTTPException(404, f"No module matching {name!r} found in this course's content tree.")
+    return result
+
+
+@app.get("/api/notifications")
+async def get_notifications():
+    return await _run(BrightspaceClient.get_notifications)
+
+
 @app.get("/api/courses/{org_unit_id}/grades")
 async def get_course_grades(org_unit_id: str):
     return await _run(BrightspaceClient.get_course_grades, org_unit_id)
@@ -141,13 +161,18 @@ async def enroll(req: EnrollRequest):
 
 class UploadRequest(BaseModel):
     assignment_url: str
-    file_path: str
+    file_paths: list[str]
+    confirm_submit: bool = False
 
 
 @app.post("/api/upload")
 async def upload(req: UploadRequest):
-    """Same "no built-in approval check" note as /api/enroll applies here."""
-    return await _run(BrightspaceClient.upload, req.assignment_url, req.file_path)
+    """confirm_submit defaults to False - see BrightspaceClient.upload's
+    docstring for exactly what that does and doesn't do, and why. Same
+    "no built-in approval check" note as /api/enroll also applies: this
+    endpoint itself doesn't ask for confirmation beyond that flag, so
+    don't expose this port beyond localhost."""
+    return await _run(BrightspaceClient.upload, req.assignment_url, req.file_paths, req.confirm_submit)
 
 
 @app.get("/healthz")

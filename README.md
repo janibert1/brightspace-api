@@ -63,14 +63,17 @@ the `[server]` extra installed) an HTTP endpoint on the same shape:
 |---|---|---|
 | `get_courses()` | `/api/courses` | Your enrolled/visible courses (org unit id + name) |
 | `get_course_content(ou)` | `/api/courses/{ou}/content` | Files/topics in a course's Content area (see caveat below) |
+| `get_course_modules(ou)` | `/api/courses/{ou}/modules` | Top-level module names/ids in a course's Content tree |
+| `get_module_description(ou, name)` | `/api/courses/{ou}/modules/description?name=` | A specific module's own description/overview text (e.g. weekly "Leerdoelen" blocks) |
 | `download_course_file(ou, topic_id)` | `/api/courses/{ou}/download/{topic_id}` | Downloads a content file (PDF-backed topics only so far) |
 | `get_course_grades(ou)` | `/api/courses/{ou}/grades` | Grade items + scores + written feedback |
 | `get_course_assignments(ou)` | `/api/courses/{ou}/assignments` | Assignment/Dropbox folders: due dates, submission status, score, feedback link |
 | `get_course_discussions(ou)` | `/api/courses/{ou}/discussions` | Forum topics per course: thread/post counts, unread flag |
 | `get_announcements()` | `/api/announcements` | Recent announcements across your courses |
 | `get_deadlines()` | `/api/deadlines` | The "Work To Do" widget — what's currently pending |
+| `get_notifications()` | `/api/notifications` | The "Update alerts" bell — cross-course announcement/grade-update feed (first page only) |
 | `enroll(course_codes)` | `/api/enroll` | Stub, not implemented |
-| `upload(assignment_url, file_path)` | `/api/upload` | Stub, not implemented |
+| `upload(assignment_url, file_paths, confirm_submit=False)` | `/api/upload` | Submits file(s) to a Dropbox/Assignment folder — real, see caveat below |
 | — | `/healthz` | `{"status": "ok", "session_loaded": true/false}` (server only) |
 
 Every method's real DOM shape (what was actually found live, not
@@ -78,12 +81,16 @@ guessed) is documented in its own docstring in `client.py` — read those
 before extending anything, they explain *why* each selector is what it
 is.
 
-`enroll`/`upload` are shape-only stubs — Brightspace's real enrollment
-and dropbox-submission UIs need their selectors confirmed live against
-your own institution before these do anything real. Neither has a
-built-in approval/confirmation check; if you implement them, add your
-own gate before calling them for real, and don't expose the HTTP server
-beyond localhost without one either.
+`enroll` is a shape-only stub — Brightspace's real enrollment UI needs
+its selectors confirmed live against your own institution before it does
+anything real. `upload` IS implemented and confirmed live end-to-end
+through staging a file, but its final step — actually clicking Submit —
+was deliberately never exercised against a real assignment (a real,
+essentially irreversible academic action) and is off by default
+(`confirm_submit=False`). Read `upload`'s docstring before turning that
+on. Neither endpoint has a built-in approval/confirmation check beyond
+that flag; don't expose the HTTP server beyond localhost without adding
+your own gate.
 
 ## Login
 
@@ -188,8 +195,16 @@ All via `.env` (in the current working directory by default — set
   and waiting for async popovers per day, a much bigger scrape than
   everything else here; `get_deadlines()` already covers "what's due
   soon" in a real list format.
-- **`enroll()` and `upload()` are unimplemented stubs.** They exist as a
-  shape to fill in, not working code.
+- **`enroll()` is an unimplemented stub.** Exists as a shape to fill in,
+  not working code. `upload()` IS implemented — see the table above and
+  its own docstring for the `confirm_submit` safety default.
+- **Notification/module tree quirks worth knowing**: the D2L homepage has
+  two different bell icons (`get_notifications()` uses the "Update
+  alerts" one, not "Subscription alerts" — they're genuinely different
+  feeds); `get_course_modules()` includes a few fixed navigational tabs
+  (Overview, Bookmarks, Course Schedule, Table of Contents) alongside
+  real content modules, since they live in the same tree with no
+  distinguishing marker beyond a missing `module_id`.
 - **Threading, if you use the HTTP server**: `BrightspaceClient` uses
   Playwright's synchronous API, which must run on the same OS thread it
   was started on. `server.py` handles this internally (a dedicated
