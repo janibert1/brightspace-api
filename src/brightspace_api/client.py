@@ -894,21 +894,27 @@ class BrightspaceClient:
                 return []
             flat = widget.evaluate(WALK_SHADOW_JS)
 
-            # Titles and their action_href appear adjacent, in order, one
-            # pair per work-item (confirmed against real data). Pair them
-            # up rather than assuming a 1:1 zip in case some items are
-            # missing a link.
+            # 2026-09-01 fix: the action_href for a work-item appears
+            # BEFORE its title in DOM walk order, not after - confirmed
+            # live by dumping the raw flat sequence (href, title, href,
+            # title, ...). The original code assumed the opposite order
+            # (title then href), which silently shifted every url onto
+            # the WRONG title by one position (and dropped the very
+            # first href entirely, since nothing was pending yet to
+            # attach it to) - real live impact: "Assignment A" ended up
+            # pointing at Assignment B's actual folder, B at C's, etc,
+            # all the way down the list. Confirmed against each folder's
+            # own real title (its page's own <h1>, independent of this
+            # widget) before concluding this was the bug and not just a
+            # one-off fluke.
             results = []
-            pending_title = None
+            pending_href = None
             for entry in flat:
-                if entry["type"] == "title":
-                    if pending_title:
-                        results.append(pending_title)
-                    pending_title = {"title": entry["value"], "section": entry["heading"], "url": None}
-                elif entry["type"] == "action_href" and pending_title is not None:
-                    pending_title["url"] = entry["value"]
-            if pending_title:
-                results.append(pending_title)
+                if entry["type"] == "action_href":
+                    pending_href = entry["value"]
+                elif entry["type"] == "title":
+                    results.append({"title": entry["value"], "section": entry["heading"], "url": pending_href})
+                    pending_href = None
             return results
         finally:
             context.close()
