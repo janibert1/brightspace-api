@@ -5,6 +5,18 @@ real Brightspace account, not a guess — see the corresponding method's
 own docstring in `client.py`/`session.py` for the full technical detail
 behind each line.
 
+## 0.6.2
+
+- Fixed `get_deadlines()`: title/href pairing was off by one for every
+  item on the list. The Work-To-Do widget's `action_href` appears
+  BEFORE its own title in DOM walk order, not after — the pairing logic
+  assumed the opposite, so every url silently pointed at the WRONG
+  title (each item got the next item's real href, and the very first
+  href was dropped entirely). Real live impact: "Assignment A" was
+  pointing at Assignment B's actual folder, B at C's, and so on down
+  the whole list — confirmed against each folder's own real `<h1>`
+  title before concluding this was the bug and not a one-off fluke.
+
 ## 0.6.1
 
 - New `get_notification_detail(url)`: the full body of one notification,
