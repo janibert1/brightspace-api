@@ -149,6 +149,13 @@ async def get_notifications():
     return await _run(BrightspaceClient.get_notifications)
 
 
+@app.get("/api/notifications/detail")
+async def get_notification_detail(url: str):
+    """`url` as a query param, taken verbatim from a get_notifications()
+    item's own `url` field."""
+    return await _run(BrightspaceClient.get_notification_detail, url)
+
+
 @app.get("/api/courses/{org_unit_id}/grades")
 async def get_course_grades(org_unit_id: str):
     return await _run(BrightspaceClient.get_course_grades, org_unit_id)

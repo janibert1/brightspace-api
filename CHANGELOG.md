@@ -5,6 +5,22 @@ real Brightspace account, not a guess — see the corresponding method's
 own docstring in `client.py`/`session.py` for the full technical detail
 behind each line.
 
+## 0.6.1
+
+- New `get_notification_detail(url)`: the full body of one notification,
+  given the `url` a `get_notifications()` item already has —
+  `get_notifications()` was always title/course/received-only by design,
+  no way to read what an announcement actually says without a one-off
+  scrape. Found chasing two real notifications that turned out to need
+  real action. Same `d2l-html-block` `html`-attribute gotcha as
+  `get_module_description()`/`get_announcements()` (the body lives in an
+  HTML attribute string, not real DOM text — invisible to
+  `inner_text()`/`text_content()`, visible in a screenshot or
+  `page.content()`). Also fixes a real false-positive: the detail page
+  also has two hidden `<h2>`s belonging to the idle-session-timeout
+  modal ("Are You Still There?") — a naive `"h1, h2"` title selector
+  picks those up first instead of the real `<h1>` title.
+
 ## 0.6.0
 
 TU Delft rolled out a newer content UI ("Lessons") as the default for

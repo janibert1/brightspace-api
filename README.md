@@ -106,6 +106,7 @@ the `[server]` extra installed) an HTTP endpoint on the same shape:
 | `get_announcements()` | `/api/announcements` | Recent announcements across your courses |
 | `get_deadlines()` | `/api/deadlines` | The "Work To Do" widget — what's currently pending |
 | `get_notifications()` | `/api/notifications` | The "Update alerts" bell — cross-course announcement/grade-update feed (first page only) |
+| `get_notification_detail(url)` | `/api/notifications/detail?url=` | The full body of one notification/announcement (title + HTML), given the `url` a `get_notifications()` item already has |
 | `enroll(course_codes)` | `/api/enroll` | Stub, not implemented |
 | `upload(assignment_url, file_paths, confirm_submit=False)` | `/api/upload` | Submits file(s) to a Dropbox/Assignment folder — real, see caveat below |
 | — | `/healthz` | `{"status": "ok", "session_loaded": true/false}` (server only) |

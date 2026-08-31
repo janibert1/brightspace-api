@@ -991,6 +991,51 @@ class BrightspaceClient:
         finally:
             context.close()
 
+    def get_notification_detail(self, url: str) -> dict:
+        """The full body of ONE notification/announcement, given the
+        `url` a get_notifications() item already has (an
+        `/d2l/le/news/<ou>/<id>/view` page). Added 2026-08-31 - a real
+        gap, not something the newer Lessons UI broke: get_notifications()
+        was always title/course/received-only by design (see its own
+        docstring), and there was no way to read what an announcement
+        actually SAYS without a one-off scrape. Found while chasing two
+        real notifications that turned out to need real action (a quiz
+        going live, a "you must self-enroll" notice) - both looked
+        title-only until this.
+
+        **The gotcha that makes this its own method, not just
+        `page.inner_text()` on the detail page**: the body content lives
+        inside a `<d2l-html-block html="...">` custom element as a raw
+        HTML *attribute string*, not as real rendered child text nodes -
+        confirmed live it shows up fine in a screenshot (the browser
+        paints it) and in `page.content()`'s raw serialized HTML (the
+        attribute value is right there in the tag), but is INVISIBLE to
+        `page.inner_text()`/`page.text_content()`/`querySelectorAll` +
+        `.textContent` - none of those see attribute values, only actual
+        child text nodes, which this element doesn't have any of; the
+        custom element renders the attribute's content into its own
+        (JS-only-visible) shadow root instead. Same underlying pattern
+        `get_module_description()`/`get_announcements()` already handle
+        correctly (`get_attribute("html")`, not innerText) - this is
+        that same fix, just also applied here."""
+        base_url = self._base_url()
+        context, page = self._new_page()
+        try:
+            page.goto(url if url.startswith("http") else f"{base_url}{url}", wait_until="networkidle")
+            page.wait_for_timeout(2000)
+            # h1 only, NOT h2 - confirmed live the page also has two hidden
+            # h2s belonging to the idle-session-timeout modal ("Are You
+            # Still There?"/"Oh, There You Are!") that a naive "h1, h2"
+            # selector picks up as a false-positive first match instead of
+            # the real announcement title.
+            title_el = page.locator("h1").first
+            title = title_el.inner_text().strip() if title_el.count() else None
+            block = page.locator("d2l-html-block").first
+            body_html = block.get_attribute("html") if block.count() else None
+            return {"title": title, "body_html": body_html, "url": page.url}
+        finally:
+            context.close()
+
     # ------------------------------------------------------------------
     # Write endpoints - unimplemented stubs, see each docstring
     # ------------------------------------------------------------------
