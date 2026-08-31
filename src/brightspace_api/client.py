@@ -138,6 +138,60 @@ method's own docstring for the full detail:
   already authenticated via the existing session) and sometimes lands on
   a separate service's own login page instead (a plain external link
   needing its own auth) - this can't distinguish the two automatically.
+
+2026-08-31 - THE REAL CONTENT API, and everything above about content/
+modules/description/download rewritten to use it. Root cause of a real
+live break: TU Delft rolled out a newer content UI ("Lessons", built on
+a `smart-curriculum` Lit/Polymer web component with real shadow DOM,
+different URLs (`/d2l/le/lessons/<ou>/{units,topics}/<id>` instead of
+`/d2l/le/content/<ou>/viewContent/<id>/View`) and a different tree
+structure entirely (`d2l-list-item-nav`, not `li.d2l-le-TreeAccordionItem`)
+- confirmed live this is now the DEFAULT for every current-quarter
+course (checked 3/3 of Jan's active 2026/27 Q1 courses, all on the new
+UI; only an already-finished past-quarter course still showed the old
+tree), so every method built against the old DOM silently broke for
+anything Jan is actually taking right now: get_course_content/
+get_course_modules/get_module_content/get_all_course_content all
+returned empty `[]` (no error - looked exactly like "no content posted
+yet"), get_external_link and download_course_file both raised
+"not found"-style errors.
+
+While investigating the new UI's shadow DOM (a real generic recursive
+shadow-piercing walker was built and worked - see git history if ever
+needed again for something this doesn't already cover), found something
+much better: Brightspace has a real, clean, officially-versioned REST
+API behind BOTH UIs - `GET /d2l/api/le/unstable/<ou>/content/toc?loadDescription=true`
+- confirmed live it returns the exact same nested Modules/Topics JSON
+tree (real `ModuleId`/`TopicId`/`Title`/`TypeIdentifier`/`Url`/
+`Completed`/`Description.Html` fields) for BOTH an old-UI course and a
+new-UI course identically - this is the actual shared data source both
+frontends render from, not something specific to the redesign. `Url` is
+the real destination directly for a `TypeIdentifier: "File"` topic (a
+static, session-authenticated `/content/enforced/...` path - no more
+scraping a PDF-viewer iframe's `src`) and a real LTI-launch quicklink
+for a `TypeIdentifier: "Link"` topic (confirmed live resolving a real
+quiz topic through to `ans.app/digital_test/assignments/.../results/new`
+with zero extra login - see [[project_personal_agent]] auto-memory for
+the Hydromechanica case this was found from).
+
+Net effect: `_get_toc()`/`_flatten_toc()` (new) replace essentially all
+of the DOM-walking described above - get_course_content/
+get_course_modules/get_module_description/get_module_content/
+get_all_course_content are now plain API calls, no browser page
+rendering needed at all for any of them (a lightweight
+`context.request` via the new `_api_get()` helper, not `_new_page()`).
+get_external_link/download_course_file still use a real browser page
+for the FINAL hop only (resolving the actual LTI redirect chain / that
+one authenticated file GET), now starting from the real URL the TOC API
+provides instead of a guessed/broken one. The old dedupe heuristic in
+get_module_content (a workaround for the old UI's own inconsistent
+click-to-view behavior) is gone entirely - nothing to dedupe against a
+real structured API; `dedupe` params on the affected methods are now
+no-ops kept only so existing callers don't break on the signature.
+`file_type` on every returned item is now Brightspace's own
+`TypeIdentifier` (e.g. `"File"`, `"Link"`) - NOT the old anchor-title-
+derived string - a real behavior change for any caller matching on the
+old values.
 """
 import re
 import urllib.parse
@@ -367,33 +421,77 @@ class BrightspaceClient:
         finally:
             context.close()
 
-    def get_course_content(self, org_unit_id: str) -> list[dict]:
-        """See the module docstring's "Known limitation" note - this
-        reflects whatever module the account currently has last-open for
-        this course, not guaranteed to be every file in every module."""
+    def _api_get(self, path: str, params: dict | None = None) -> dict:
+        """Plain authenticated GET against Brightspace's own REST API
+        (`/d2l/api/...`), using the same session cookies as everything
+        else here - no browser page/rendering needed, just a lightweight
+        API request context. See module docstring's "The real content
+        API" section for how this was found and why it replaced almost
+        all of the old DOM-scraping content methods below."""
+        self.start()
         base_url = self._base_url()
-        context, page = self._new_page()
+        context = self._browser.new_context(storage_state=str(cfg.storage_state_file))
         try:
-            page.goto(f"{base_url}/d2l/le/content/{org_unit_id}/Home", wait_until="networkidle")
-            page.wait_for_timeout(2000)
-            items = page.locator('a.d2l-link[href*="/viewContent/"]')
-            count = items.count()
-            results = []
-            for i in range(count):
-                item = items.nth(i)
-                href = item.get_attribute("href")
-                title_attr = item.get_attribute("title") or ""
-                m = re.match(r"/d2l/le/content/\d+/viewContent/(\d+)/View", href or "")
-                file_type = title_attr.rsplit(" - ", 1)[-1] if " - " in title_attr else None
-                results.append({
-                    "topic_id": m.group(1) if m else None,
-                    "title": item.inner_text().strip(),
-                    "file_type": file_type,
-                    "url": f"{base_url}{href}" if href and href.startswith("/") else href,
-                })
-            return results
+            resp = context.request.get(f"{base_url}{path}", params=params or {})
+            if resp.status != 200:
+                raise BrightspaceError(f"Brightspace API GET {path} returned {resp.status}: {resp.text()[:300]}")
+            return resp.json()
         finally:
             context.close()
+
+    def _get_toc(self, org_unit_id: str) -> dict:
+        """Raw table-of-contents JSON for a course - real, official,
+        UI-independent Brightspace REST API, NOT scraped HTML. Confirmed
+        live it works identically for both the old classic tree UI and
+        the newer `smart-curriculum`/Lessons UI (2026-08-31 finding) -
+        this is the actual data source both frontends render from, so
+        it's the right thing to call regardless of which UI a given
+        course happens to use. `loadDescription=true` is required to get
+        each Module's/Topic's own `Description.Html` populated (used by
+        get_module_description) - without it every Description comes
+        back empty."""
+        return self._api_get(f"/d2l/api/le/unstable/{org_unit_id}/content/toc", params={"loadDescription": "true"})
+
+    @staticmethod
+    def _flatten_toc(modules: list[dict], folder_path: list[str] | None = None) -> list[dict]:
+        """Recursively flattens the TOC's nested Modules/Topics tree into
+        one flat list of real content items (Topics only - Modules
+        themselves are folders, not content, see get_course_modules for
+        those). Each item's `folder_path` is the chain of module names
+        from the course root down to wherever it actually lives (`[]` for
+        a topic directly in a top-level module) - same field/meaning as
+        the old DOM-scraped get_module_content used to produce, kept
+        for compatibility with existing callers."""
+        folder_path = folder_path or []
+        out = []
+        for module in modules:
+            for topic in module.get("Topics", []):
+                out.append({
+                    "topic_id": str(topic["TopicId"]),
+                    "title": topic["Title"],
+                    "file_type": topic.get("TypeIdentifier"),
+                    "url": topic.get("Url"),
+                    "content_page_url": topic.get("ContentUrl"),
+                    "completed": topic.get("Completed", False),
+                    "folder_path": list(folder_path),
+                })
+            if module.get("Modules"):
+                out.extend(BrightspaceClient._flatten_toc(module["Modules"], folder_path + [module["Title"]]))
+        return out
+
+    def get_course_content(self, org_unit_id: str) -> list[dict]:
+        """ALL real content items across the WHOLE course - every module,
+        however deeply nested. This used to only reflect whichever module
+        the account happened to have last open (see git history for the
+        old DOM-scraped version and its documented limitation) - fixed
+        2026-08-31 by switching to the real TOC API (`_get_toc`), which
+        has no such "currently open" concept at all. `file_type` is now
+        Brightspace's own `TypeIdentifier` field (e.g. "File", "Link") -
+        NOT the old anchor-title-derived string, a real behavior change
+        for any existing caller matching on specific old file_type
+        values."""
+        toc = self._get_toc(org_unit_id)
+        return self._flatten_toc(toc.get("Modules", []))
 
     def get_course_modules(self, org_unit_id: str, include_navigation_tabs: bool = False) -> list[dict]:
         """Lists the top-level module tree entries in a course's Content
@@ -408,277 +506,93 @@ class BrightspaceClient:
         listing the top-level names doesn't require clicking anything -
         only loading one specific module's content/description does.
 
-        By default, excludes a handful of fixed navigational tabs that
-        live in the same tree as real modules but aren't actual content
-        (confirmed live: "Overview", "Bookmarks", "Course Schedule",
-        "Table of Contents" - always present, generic across TU Delft
-        courses, never had a `module_id`). Pass
-        `include_navigation_tabs=True` to get the old, unfiltered
-        behavior back (those items are still returned with
-        `module_id: None`, same as before)."""
-        base_url = self._base_url()
-        context, page = self._new_page()
-        try:
-            page.goto(f"{base_url}/d2l/le/content/{org_unit_id}/Home", wait_until="networkidle")
-            page.wait_for_timeout(2000)
-            items = page.locator("li.d2l-le-TreeAccordionItem-Root")
-            results = []
-            for i in range(items.count()):
-                item = items.nth(i)
-                data_key = item.get_attribute("data-key") or ""
-                m = re.search(r"ModuleCO-(\d+)", data_key)
-                module_id = m.group(1) if m else None
-                if module_id is None and not include_navigation_tabs:
-                    continue
-                anchor = item.locator("a.d2l-le-TreeAccordionItem-anchor").first
-                # The anchor's inner_text() includes offscreen a11y text
-                # after the visible name ("Week 1: Spanning en Rek\n module:
-                # contains 2 sub-modules\nselected") - the visible name is
-                # always first in DOM order, so the first line is enough,
-                # same pragmatic split-on-newline approach used for
-                # get_course_discussions' posts count.
-                name = anchor.inner_text().split("\n")[0].strip() if anchor.count() else None
-                if name:
-                    results.append({"module_id": module_id, "name": name})
-            return results
-        finally:
-            context.close()
+        **2026-08-31**: switched from scraping the classic tree HTML to
+        the real TOC API (see `_get_toc`) - `include_navigation_tabs` is
+        now a no-op kept only for backward call-signature compatibility.
+        The TOC API has no concept of the old UI's generic navigational
+        tabs ("Overview"/"Bookmarks"/etc, which were never real modules
+        anyway, just fixed accordion entries) - they simply don't appear
+        in this data at all, so there's nothing left to filter."""
+        toc = self._get_toc(org_unit_id)
+        return [{"module_id": str(m["ModuleId"]), "name": m["Title"]} for m in toc.get("Modules", [])]
 
     def get_module_description(self, org_unit_id: str, module_name: str) -> dict | None:
-        """Loads a specific top-level module's description/overview text
-        (e.g. the weekly "Leerdoelen" blocks TU Delft courses commonly
-        use) from the Content area. Matches `module_name` against the
-        visible tree item text (case-insensitive substring) - use
-        get_course_modules() first if you're not sure of the exact name.
-        Returns None if nothing matched.
+        """A specific top-level module's description/overview text (e.g.
+        the weekly "Leerdoelen" blocks TU Delft courses commonly use).
+        Matches `module_name` against the module title (case-insensitive
+        substring) - use get_course_modules() first if you're not sure of
+        the exact name. Returns None if nothing matched.
 
-        The module tree is JS-driven, not URL-addressable: each item's
-        link is `href="javascript:void(0)"`, triggering an in-page AJAX
-        update that swaps the right-hand panel without changing the URL
-        (confirmed live) - so there's no direct link to construct for "the
-        page for module X", the only way to load a specific module's text
-        is to actually click it, which is what this does.
-
-        Description is returned as raw HTML (`description_html`, same
-        `d2l-html-block` pattern used for announcements/grades feedback
-        elsewhere) - it's whatever rich text the instructor put there,
-        not plain text."""
-        base_url = self._base_url()
-        context, page = self._new_page()
-        try:
-            page.goto(f"{base_url}/d2l/le/content/{org_unit_id}/Home", wait_until="networkidle")
-            page.wait_for_timeout(2000)
-            items = page.locator("li.d2l-le-TreeAccordionItem-Root")
-            target_anchor, matched_name = None, None
-            for i in range(items.count()):
-                item = items.nth(i)
-                anchor = item.locator("a.d2l-le-TreeAccordionItem-anchor").first
-                if anchor.count() == 0:
-                    continue
-                name = anchor.inner_text().split("\n")[0].strip()
-                if module_name.lower() in name.lower():
-                    target_anchor, matched_name = anchor, name
-                    break
-            if target_anchor is None:
-                return None
-
-            target_anchor.click()
-            page.wait_for_timeout(2000)
-            block = page.locator("div.d2l-htmlblock-untrusted d2l-html-block").first
-            description_html = block.get_attribute("html") if block.count() else None
-            return {"name": matched_name, "description_html": description_html}
-        finally:
-            context.close()
+        **2026-08-31**: switched from click-and-scrape to the real TOC
+        API (see `_get_toc`) - each Module object already carries its own
+        `Description.Html` when the API is called with
+        `loadDescription=true` (which `_get_toc` always does), so no
+        clicking or page navigation is needed at all anymore. Old
+        docstring's claim that the module tree is "JS-driven, not
+        URL-addressable" is still true of the UI, just no longer
+        relevant - this doesn't touch the UI."""
+        toc = self._get_toc(org_unit_id)
+        for module in toc.get("Modules", []):
+            if module_name.lower() in module["Title"].lower():
+                return {"name": module["Title"], "description_html": module.get("Description", {}).get("Html")}
+        return None
 
     def get_module_content(self, org_unit_id: str, module_name: str, dedupe: bool = True) -> list[dict] | None:
         """Like get_course_content, but scoped to one specific top-level
-        module (matched the same way as get_module_description - see its
-        docstring for why clicking is unavoidable here) and - unlike
-        get_course_content - actually descends into that module's nested
-        sub-folders instead of only seeing whichever single folder
-        happens to be selected.
+        module - descends into that module's nested sub-folders however
+        deep they go. Each returned item has a `folder_path` field - the
+        chain of folder names from the module root down to wherever the
+        item actually lives (`[]` for an item directly in the module
+        itself).
 
-        This exists because get_course_content has a real, confirmed-live
-        gap: a module's content isn't necessarily flat. Real example:
-        Sterkteleer's "Week 1: Spanning en Rek" module contains a
-        sub-folder "College 1 Spanning", which itself contains a further
-        sub-folder "Werkcollege 1" - three levels deep before reaching
-        actual files. get_course_content() only ever sees whichever ONE
-        of these happens to be the currently-selected view; it has no way
-        to know the others exist. This method walks the whole subtree
-        under module_name instead, however deep it goes (bounded by
-        max_depth as a safety cap - not because deeper nesting was
-        observed, just as a defensive limit against an unexpected
-        circular/runaway tree).
-
-        Each returned item has a `folder_path` field - a list of folder
-        names from the module root down to wherever the item actually
-        lives (e.g. `["College 1 Spanning", "Werkcollege 1"]`, or `[]` for
-        an item directly in the module itself) - so results from
-        different folders aren't ambiguous.
-
-        Direct-child selection (not "all descendants") is the whole
-        reason this needed real DOM investigation rather than reusing
-        get_course_content's simpler query: a naive
-        `tree_item.locator("li.d2l-le-TreeAccordionItem")` matches EVERY
-        descendant at any depth, not just immediate children, which would
-        silently double-visit deeper folders once as a false direct child
-        and again during real recursion. Confirmed live that
-        `:scope > ul > li.d2l-le-TreeAccordionItem` isolates exactly one
-        level at a time instead.
-
-        **dedupe=True (the default)**: a folder that has sub-folders
-        doesn't reliably show a distinct "just this folder's own items"
-        view when clicked - confirmed live it can instead show a mix that
-        includes some or all of a sub-folder's own items too (e.g.
-        Sterkteleer's "Week 1" module showed exactly its first
-        sub-folder's content; "College 1 Spanning" showed its 3 own items
-        PLUS all 3 of its "Werkcollege 1" sub-folder's items merged
-        together). Root cause not fully pinned down (could be a stale
-        selection carried over from the click sequence, could be D2L
-        deliberately flattening nested content into parent views) - but
-        the *pattern* is consistent and testable: when the exact same
-        topic_id shows up at more than one depth within the same branch,
-        it's always at a shallower folder_path AND a deeper one together,
-        never at two unrelated branches. With dedupe on, this keeps only
-        the deepest (most specific) occurrence of each topic_id and drops
-        the shallower one(s) - a heuristic, not a proven-correct
-        interpretation of which occurrence is the "real" one, but it
-        turns a confusing near-duplicate list into a clean one for the
-        common case. Pass dedupe=False to get the complete, unfiltered
-        data instead (useful if you want to inspect the raw overlap
-        yourself, or if your course structure doesn't match the pattern
-        above).
+        **2026-08-31**: switched from click-and-scrape to the real TOC
+        API (see `_get_toc`/`_flatten_toc`) - the old docstring's
+        documented gaps (get_course_content only seeing "whichever module
+        happens to be selected", and folders needing a dedupe heuristic
+        because clicking one showed a confusing mix of its own + a
+        sub-folder's items) were both artifacts of the old DOM-scraping
+        approach and don't exist with a real structured API - there's
+        nothing to select, click, or accidentally merge. `dedupe` is now
+        a no-op kept only for backward call-signature compatibility.
 
         Returns None if no module matched module_name."""
-        base_url = self._base_url()
-        context, page = self._new_page()
-        try:
-            page.goto(f"{base_url}/d2l/le/content/{org_unit_id}/Home", wait_until="networkidle")
-            page.wait_for_timeout(2000)
-            items = page.locator("li.d2l-le-TreeAccordionItem-Root")
-            target_item = None
-            for i in range(items.count()):
-                item = items.nth(i)
-                anchor = item.locator("a.d2l-le-TreeAccordionItem-anchor").first
-                if anchor.count() == 0:
-                    continue
-                name = anchor.inner_text().split("\n")[0].strip()
-                if module_name.lower() in name.lower():
-                    target_item = item
-                    break
-            if target_item is None:
-                return None
-
-            results = []
-            self._collect_content_items(page, base_url, target_item, folder_path=[], results=results, depth=0)
-            if dedupe:
-                results = self._dedupe_by_deepest_folder(results)
-            return results
-        finally:
-            context.close()
-
-    @staticmethod
-    def _dedupe_by_deepest_folder(items: list[dict]) -> list[dict]:
-        """For each topic_id, keeps only the occurrence(s) at the
-        greatest folder_path depth, dropping shallower duplicates. If
-        multiple occurrences tie for the deepest depth (genuinely
-        different branches, not the same ancestor/descendant chain),
-        all of them are kept - this only removes shallower entries that
-        have a same-topic_id match somewhere deeper, it never removes
-        the only copy of anything. See get_module_content's own
-        docstring for why this heuristic exists and its limits."""
-        by_topic: dict[str, list[dict]] = {}
-        for item in items:
-            key = item.get("topic_id") or f"__no_id__{id(item)}"  # items without a topic_id are never deduped against each other
-            by_topic.setdefault(key, []).append(item)
-
-        deduped = []
-        for key, group in by_topic.items():
-            if key.startswith("__no_id__") or len(group) == 1:
-                deduped.extend(group)
-                continue
-            max_depth = max(len(g["folder_path"]) for g in group)
-            deduped.extend(g for g in group if len(g["folder_path"]) == max_depth)
-        return deduped
+        toc = self._get_toc(org_unit_id)
+        for module in toc.get("Modules", []):
+            if module_name.lower() in module["Title"].lower():
+                return self._flatten_toc([module])
+        return None
 
     def get_all_course_content(self, org_unit_id: str, dedupe: bool = True) -> list[dict]:
-        """The real fix for get_course_content's documented "only sees
-        whichever module happens to be selected" limitation: walks EVERY
-        top-level module (via get_course_modules - navigation tabs like
-        "Bookmarks" excluded by that method's own default) and each
-        module's full nested subtree (via get_module_content), and
-        aggregates everything into one flat list. This is a genuine
-        "show me the entire course" call, not a workaround.
+        """The whole course's content, every module and however deeply
+        nested, each item tagged with which top-level `module` it came
+        from (in addition to `folder_path`, its location within that
+        module).
 
-        The real cost: one full page load + click sequence per
-        module/sub-folder in the whole course, not the single page load
-        get_course_content() uses - for a course with many modules and
-        deep nesting this can take a while (tens of seconds to a few
-        minutes, roughly linear in the number of modules/folders). Use
-        get_module_content() directly instead if you already know which
-        module you need - this is for when you genuinely need the whole
-        course.
-
-        Each item gets a `module` field (which top-level module it came
-        from) in addition to `folder_path` (its location within that
-        module - see get_module_content's docstring). `dedupe` is passed
-        straight through to each get_module_content() call - see that
-        method's docstring for what it does and why it defaults on."""
-        modules = self.get_course_modules(org_unit_id)
+        **2026-08-31**: now a thin wrapper - get_course_content() itself
+        already returns the whole course via the real TOC API (see that
+        method's docstring for the history of why this distinction used
+        to matter), so this just adds the extra `module` field on top
+        rather than doing its own separate module-by-module walk.
+        `dedupe` is now a no-op kept only for backward call-signature
+        compatibility."""
+        toc = self._get_toc(org_unit_id)
         all_items = []
-        for module in modules:
-            items = self.get_module_content(org_unit_id, module["name"], dedupe=dedupe)
-            if items is None:
-                continue
-            for item in items:
-                item["module"] = module["name"]
+        for module in toc.get("Modules", []):
+            for item in self._flatten_toc([module]):
+                item["module"] = module["Title"]
                 all_items.append(item)
         return all_items
 
-    def _collect_content_items(self, page, base_url, tree_item, folder_path, results, depth, max_depth=6):
-        anchor = tree_item.locator("a.d2l-le-TreeAccordionItem-anchor").first
-        anchor.click()
-        page.wait_for_timeout(1500)
-
-        file_items = page.locator('a.d2l-link[href*="/viewContent/"]')
-        for i in range(file_items.count()):
-            it = file_items.nth(i)
-            href = it.get_attribute("href")
-            title_attr = it.get_attribute("title") or ""
-            m = re.match(r"/d2l/le/content/\d+/viewContent/(\d+)/View", href or "")
-            file_type = title_attr.rsplit(" - ", 1)[-1] if " - " in title_attr else None
-            results.append({
-                "topic_id": m.group(1) if m else None,
-                "title": it.inner_text().strip(),
-                "file_type": file_type,
-                "url": f"{base_url}{href}" if href and href.startswith("/") else href,
-                "folder_path": list(folder_path),
-            })
-
-        if depth >= max_depth:
-            return
-        sub_items = tree_item.locator(":scope > ul > li.d2l-le-TreeAccordionItem")
-        for i in range(sub_items.count()):
-            sub = sub_items.nth(i)
-            sub_anchor = sub.locator("a.d2l-le-TreeAccordionItem-anchor").first
-            if sub_anchor.count() == 0:
-                continue
-            sub_name = sub_anchor.inner_text().split("\n")[0].strip()
-            self._collect_content_items(
-                page, base_url, sub, folder_path=folder_path + [sub_name], results=results, depth=depth + 1
-            )
-
     def get_external_link(self, org_unit_id: str, topic_id: str) -> dict:
-        """Resolves the real destination behind a Content topic's "Open
-        in New Window" button (External Resource / External Learning
-        Tool topics - the kind get_course_content()/get_module_content()
-        list with a `file_type` that isn't a plain file). The button's
-        destination isn't a static href in the page - Brightspace
-        resolves it via JS at click time (often an LTI launch through
-        `/d2l/lti/...` that hands off a signed, already-authenticated
-        request) - so this actually clicks it and reports where the
-        resulting new tab lands.
+        """Resolves the real destination behind a Content topic that's an
+        external link/tool (an LTI launch, `TypeIdentifier: "Link"` in
+        the TOC data - the kind get_course_content()/get_module_content()
+        list with a `file_type` that isn't `"File"`). The destination
+        isn't a static URL Brightspace will just hand you - it requires
+        actually following the real LTI launch handshake (a signed,
+        already-authenticated redirect/form-post chain), so this
+        navigates a real browser page through it and reports where it
+        lands.
 
         Confirmed live against two real, different cases:
         - An "External Learning Tool" (LTI) topic resolved cleanly all
@@ -693,39 +607,48 @@ class BrightspaceClient:
           whatever the Brightspace session covers.
 
         Because of that second case, treat `url`/`title` as "wherever the
-        button's own navigation ended up", not a guaranteed final content
-        URL. `likely_requires_separate_login` is a best-effort heuristic
+        navigation ended up", not a guaranteed final content URL.
+        `likely_requires_separate_login` is a best-effort heuristic
         (checked against the real TU Delft/SURFconext login page from the
         second case above, but not against a broad sample of other
         institutions' SSO pages) - True if the landing URL/title matches
         common login-page patterns (a `login.`/`sso.`/`auth.` subdomain,
         or "log in"/"sign in"/"inloggen" in the title), False otherwise.
-        It's a hint to check manually, not a guarantee either way - a
-        genuine content page could coincidentally match, and an
-        unfamiliar institution's login page might not match any of these
-        patterns at all."""
+        It's a hint to check manually, not a guarantee either way.
+
+        **2026-08-31**: the old "Open in New Window" button-click
+        approach broke outright on TU Delft's newer Lessons/
+        `smart-curriculum` UI (different button, "Open Link", and the
+        classic `/viewContent/{id}/View` URL this used to start from
+        doesn't correspond to anything in the new UI either). Fixed by
+        looking the topic up in the real TOC API first (see `_get_toc`)
+        to get its actual `Url` (a `quickLink.d2l?...type=lti...`
+        launcher) and navigating there directly - UI-independent, and
+        more direct than clicking a button whose exact label/selector
+        can change again. Raises if the topic isn't found or isn't a
+        Link-type topic (a File-type topic has no "external destination"
+        to resolve - use download_course_file instead)."""
+        toc = self._get_toc(org_unit_id)
+        topic = next((t for t in self._flatten_toc(toc.get("Modules", [])) if t["topic_id"] == str(topic_id)), None)
+        if topic is None:
+            raise BrightspaceError(f"Topic {topic_id!r} not found in this course's TOC.")
+        if topic["file_type"] == "File":
+            raise BrightspaceError(
+                f"Topic {topic_id!r} ({topic['title']!r}) is a File, not an external link - "
+                "use download_course_file instead."
+            )
+        if not topic.get("url"):
+            raise BrightspaceError(f"Topic {topic_id!r} ({topic['title']!r}) has no Url in the TOC data to follow.")
+
         base_url = self._base_url()
         context, page = self._new_page()
         try:
-            view_url = f"{base_url}/d2l/le/content/{org_unit_id}/viewContent/{topic_id}/View"
-            page.goto(view_url, wait_until="networkidle")
-            page.wait_for_timeout(1500)
-
-            btn = page.locator('button:has-text("Open in New Window")').first
-            if btn.count() == 0:
-                raise BrightspaceError(
-                    "No 'Open in New Window' button found - this topic might be a plain file "
-                    "(use download_course_file instead) or a type not seen yet."
-                )
-            with page.context.expect_page() as new_page_info:
-                btn.click()
-            new_page = new_page_info.value
+            page.goto(f"{base_url}{topic['url']}", wait_until="networkidle")
             try:
-                new_page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
                 pass  # some destinations keep a long-lived connection open (streaming, polling) - report wherever it got to rather than hang
-            landed_url, landed_title = new_page.url, new_page.title()
-            new_page.close()
+            landed_url, landed_title = page.url, page.title()
             return {
                 "url": landed_url,
                 "title": landed_title,
@@ -737,36 +660,38 @@ class BrightspaceClient:
     def download_course_file(self, org_unit_id: str, topic_id: str) -> Path:
         """Downloads a file by its topic id (from get_course_content's
         "topic_id" field) to a local cache and returns the path to it.
-        PDF-backed topics only for now - see module docstring. Re-downloads
-        are cheap to skip: if already cached locally, returns that copy
-        without re-scraping."""
+        Re-downloads are cheap to skip: if already cached locally,
+        returns that copy without re-fetching.
+
+        **2026-08-31**: switched from scraping the PDF-viewer iframe's
+        `src` (broken outright on the new Lessons UI - it uses a
+        different `d2l-pdf-viewer` custom element with a shadow-DOM
+        canvas render, no plain iframe at all) to the real TOC API,
+        which already has the actual static file URL in the topic's
+        `Url` field (e.g. `/content/enforced/844747-.../Hydromechanics.pdf`)
+        - no page rendering needed at all, just fetch that URL directly.
+        Only File-type topics have a real file to fetch this way; raises
+        for anything else (same as before, just a clearer check)."""
+        toc = self._get_toc(org_unit_id)
+        topic = next((t for t in self._flatten_toc(toc.get("Modules", [])) if t["topic_id"] == str(topic_id)), None)
+        if topic is None:
+            raise BrightspaceError(f"Topic {topic_id!r} not found in this course's TOC.")
+        if topic["file_type"] != "File" or not topic.get("url"):
+            raise BrightspaceError(
+                f"Topic {topic_id!r} ({topic['title']!r}) isn't a downloadable File "
+                f"(TypeIdentifier={topic['file_type']!r}) - use get_external_link for a Link-type topic."
+            )
+
         base_url = self._base_url()
-        context, page = self._new_page()
+        file_url = f"{base_url}{topic['url']}"
+        filename = urllib.parse.unquote(topic["url"].rsplit("/", 1)[-1].split("?")[0]) or f"{topic_id}.pdf"
+        dest_dir = cfg.downloads_dir / org_unit_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / filename
+
+        self.start()
+        context = self._browser.new_context(storage_state=str(cfg.storage_state_file))
         try:
-            view_url = f"{base_url}/d2l/le/content/{org_unit_id}/viewContent/{topic_id}/View"
-            page.goto(view_url, wait_until="networkidle")
-            page.wait_for_timeout(1500)
-
-            iframe = page.locator("iframe.d2l-fileviewer-rendered-pdf")
-            if iframe.count() == 0:
-                raise BrightspaceError(
-                    "Only PDF-viewer-backed topics are downloadable so far (see client.py module "
-                    "docstring) - this topic didn't render one, might be a non-PDF file type or an "
-                    "external tool link, not built against the real DOM yet."
-                )
-            src = iframe.get_attribute("src")
-            parsed = urllib.parse.urlparse(src)
-            file_param = urllib.parse.parse_qs(parsed.query).get("file", [None])[0]
-            if not file_param:
-                raise BrightspaceError("PDF viewer iframe found but had no 'file=' param - unexpected shape.")
-            file_url = f"{base_url}{urllib.parse.unquote(file_param)}"
-
-            filename = file_param.rsplit("/", 1)[-1].split("?")[0]
-            filename = urllib.parse.unquote(filename) or f"{topic_id}.pdf"
-            dest_dir = cfg.downloads_dir / org_unit_id
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest_path = dest_dir / filename
-
             resp = context.request.get(file_url)
             if resp.status != 200:
                 raise BrightspaceError(f"Brightspace returned {resp.status} fetching the file itself.")

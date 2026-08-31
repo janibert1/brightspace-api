@@ -93,12 +93,12 @@ the `[server]` extra installed) an HTTP endpoint on the same shape:
 | `BrightspaceClient` method | `GET`/`POST` | What it returns |
 |---|---|---|
 | `get_courses()` | `/api/courses` | Your enrolled/visible courses (org unit id + name) |
-| `get_course_content(ou)` | `/api/courses/{ou}/content` | Files/topics in a course's Content area (see caveat below) |
-| `get_course_modules(ou)` | `/api/courses/{ou}/modules` | Top-level module names/ids in a course's Content tree (navigation tabs excluded by default) |
+| `get_course_content(ou)` | `/api/courses/{ou}/content` | **Every** file/link in a course's Content area, every module, however deeply nested |
+| `get_course_modules(ou)` | `/api/courses/{ou}/modules` | Top-level module names/ids in a course's Content tree |
 | `get_module_description(ou, name)` | `/api/courses/{ou}/modules/description?name=` | A specific module's own description/overview text (e.g. weekly "Leerdoelen" blocks) |
-| `get_module_content(ou, name, dedupe=True)` | `/api/courses/{ou}/modules/content?name=` | Everything under a module, **including nested sub-folders**, deduplicated by default — see caveat below |
-| `get_all_course_content(ou, dedupe=True)` | `/api/courses/{ou}/content/all` | Every module's full content, aggregated — genuinely "show me the whole course" (slow, see caveat below) |
-| `download_course_file(ou, topic_id)` | `/api/courses/{ou}/download/{topic_id}` | Downloads a content file (PDF-backed topics only so far) |
+| `get_module_content(ou, name, dedupe=True)` | `/api/courses/{ou}/modules/content?name=` | Everything under one module, including nested sub-folders (`dedupe` is a no-op now, kept for compatibility) |
+| `get_all_course_content(ou, dedupe=True)` | `/api/courses/{ou}/content/all` | Same as `get_course_content()`, each item also tagged with which top-level `module` it's in (`dedupe` is a no-op now, kept for compatibility) |
+| `download_course_file(ou, topic_id)` | `/api/courses/{ou}/download/{topic_id}` | Downloads a content file — any `TypeIdentifier: "File"` topic, not just PDFs |
 | `get_external_link(ou, topic_id)` | `/api/courses/{ou}/content/{topic_id}/external-link` | Resolves an "External Resource"/"External Learning Tool" topic's real destination URL, plus a best-effort "did this need a separate login" flag |
 | `get_course_grades(ou)` | `/api/courses/{ou}/grades` | Grade items + scores + written feedback |
 | `get_course_assignments(ou)` | `/api/courses/{ou}/assignments` | Assignment/Dropbox folders: due dates, submission status, score, feedback link |
@@ -240,6 +240,28 @@ landed.
   excludes "Overview"/"Bookmarks"/"Course Schedule"/"Table of Contents"
   by default (they never have a real `module_id`). Pass
   `include_navigation_tabs=True` for the old behavior back.
+- **2026-08-31 — everything content-related broke outright for any
+  current course.** TU Delft rolled out a newer content UI ("Lessons",
+  a `smart-curriculum` web component with real shadow DOM, different
+  URLs and tree structure entirely) as the default for every 2026/27 Q1
+  course — every content/module/download method above silently returned
+  empty results or raised "not found" for anything Jan is actually
+  taking right now (an older, already-finished course still on the
+  classic UI kept working, which is what made this easy to miss).
+  **Real fix, not a patch**: found and switched to Brightspace's own
+  underlying REST API (`GET /d2l/api/le/unstable/<ou>/content/toc`),
+  confirmed live to be the same data source BOTH the old and new UI
+  render from — so this isn't UI-specific, it'll keep working through
+  future redesigns the way DOM scraping never could. Net effect beyond
+  just "fixed": `get_course_content()`'s old "whichever module happens
+  to be selected" caveat above is now GONE — it returns the whole
+  course in one fast API call, no browser rendering needed for any of
+  the listing methods at all anymore (only `get_external_link`/
+  `download_course_file` still touch a real page, for the one hop that
+  genuinely needs it). `file_type` on every item is now Brightspace's
+  own `TypeIdentifier` field (`"File"`, `"Link"`, etc), not the old
+  scraped string — a real value change if anything matched on the old
+  ones. Full detail in `client.py`'s module docstring, dated entry.
 
 **Not fixed (genuinely not fixable right now, not just left undone):**
 

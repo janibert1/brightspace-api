@@ -5,6 +5,37 @@ real Brightspace account, not a guess — see the corresponding method's
 own docstring in `client.py`/`session.py` for the full technical detail
 behind each line.
 
+## 0.6.0
+
+TU Delft rolled out a newer content UI ("Lessons") as the default for
+every current course — silently broke every content/module/download
+method for anything actually being taken right now (an old, finished
+course on the classic UI kept working, which hid this at first).
+
+- `get_course_content()`, `get_course_modules()`, `get_module_description()`,
+  `get_module_content()`, `get_all_course_content()`, `get_external_link()`,
+  `download_course_file()`: all rewritten to use Brightspace's own real
+  REST API (`GET /d2l/api/le/unstable/<ou>/content/toc`) instead of
+  scraping either UI's DOM — confirmed live this API is the shared data
+  source both the old and new UI render from, so it works identically
+  for both, and won't break again the next time TU Delft changes the
+  frontend.
+- Real side effect, not just a fix: `get_course_content()` now returns
+  the WHOLE course (every module, however nested) in one fast API call
+  — the old "only sees whichever module happens to be selected"
+  limitation is gone, not just documented-around anymore.
+- `file_type` on every content item is now Brightspace's own
+  `TypeIdentifier` (`"File"`, `"Link"`, etc), not the old scraped
+  anchor-title string — a real value change for anything matching on
+  the old strings.
+- `dedupe` params on `get_module_content()`/`get_all_course_content()`
+  are now no-ops (nothing left to dedupe against a real structured API)
+  — kept only so existing call sites don't break.
+- Found while fixing this: `get_external_link()` on a `TypeIdentifier:
+  "Link"` (LTI) topic can resolve straight through to the real
+  destination with zero extra login — confirmed live against an actual
+  quiz topic, landed cleanly on `ans.app/digital_test/assignments/.../results/new`.
+
 ## 0.5.0
 
 Fixes to real, previously-documented limitations, plus more docs.
