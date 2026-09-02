@@ -5,6 +5,23 @@ real Brightspace account, not a guess — see the corresponding method's
 own docstring in `client.py`/`session.py` for the full technical detail
 behind each line.
 
+## 0.6.3
+
+- Fixed `get_external_link()` 500ing on any Link-type topic whose TOC
+  `Url` is already a full absolute URL (a plain "External Resource"
+  pointing straight at a third-party page, as opposed to a
+  Brightspace-internal `quickLink.d2l?...` launcher). The code
+  unconditionally prepended `base_url` onto `topic["url"]`, producing a
+  malformed glued-together URL (e.g.
+  `https://brightspace.tudelft.nlhttps://arendschwab.com/...`) that
+  `page.goto()` rejects outright — surfaced as an unhandled exception,
+  a bare 500 from the FastAPI wrapper with no useful detail. Found via
+  a real course-audit run hitting a textbook download link stored this
+  way. Fixed with the same `url if url.startswith("http") else
+  f"{base_url}{url}"` guard `get_notification_detail()` already uses.
+  Confirmed live: the same request now correctly resolves to
+  `https://arendschwab.com/teaching/advdynbook/`.
+
 ## 0.6.2
 
 - Fixed `get_deadlines()`: title/href pairing was off by one for every

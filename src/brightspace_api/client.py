@@ -643,7 +643,19 @@ class BrightspaceClient:
         base_url = self._base_url()
         context, page = self._new_page()
         try:
-            page.goto(f"{base_url}{topic['url']}", wait_until="networkidle")
+            # 2026-09-02: some Link-type topics (e.g. a plain "External
+            # Resource" pointing straight at a third-party page, as
+            # opposed to a Brightspace-internal quickLink) already carry
+            # a full absolute URL in the TOC's Url field. Blindly
+            # prepending base_url onto that produced a malformed
+            # double-URL (base_url + absolute URL glued together),
+            # which page.goto() rejects outright - surfaced as an
+            # unhandled exception -> 500 from the FastAPI wrapper.
+            # Fixed to match the same startswith("http") guard already
+            # used elsewhere in this file (see get_notification_detail's
+            # own page.goto() call).
+            target = topic["url"] if topic["url"].startswith("http") else f"{base_url}{topic['url']}"
+            page.goto(target, wait_until="networkidle")
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
