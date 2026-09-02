@@ -5,6 +5,19 @@ real Brightspace account, not a guess — see the corresponding method's
 own docstring in `client.py`/`session.py` for the full technical detail
 behind each line.
 
+## 0.6.4
+
+- Fixed `download_course_file`'s FastAPI route hardcoding
+  `media_type="application/pdf"` for every download regardless of the
+  actual file. Many course "File" topics are really HTML lesson/
+  description pages (Brightspace stores these as `.html` content files
+  alongside real PDFs), and were being served with a PDF content-type —
+  correct bytes, wrong header, tripping up any client that trusts
+  `Content-Type` over the filename. Found via a real course-content
+  audit downloading an HTML page and getting `application/pdf` back.
+  Now guesses the media type from the real filename via `mimetypes`,
+  falling back to the old PDF default only when genuinely undetermined.
+
 ## 0.6.3
 
 - Fixed `get_external_link()` 500ing on any Link-type topic whose TOC

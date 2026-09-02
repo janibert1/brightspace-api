@@ -22,6 +22,7 @@ lets the asyncio event loop keep serving other things (like /healthz)
 while a scrape is in flight.
 """
 import asyncio
+import mimetypes
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
@@ -104,7 +105,15 @@ async def get_course_content(org_unit_id: str):
 @app.get("/api/courses/{org_unit_id}/download/{topic_id}")
 async def download_course_file(org_unit_id: str, topic_id: str):
     path = await _run(BrightspaceClient.download_course_file, org_unit_id, topic_id)
-    return FileResponse(str(path), filename=path.name, media_type="application/pdf")
+    # 2026-09-02: media_type was hardcoded to "application/pdf" regardless
+    # of the actual file - many course "File" topics are really HTML
+    # lesson/description pages (Brightspace stores these as .html content
+    # files), and were being served with a PDF content-type, mislabeling
+    # them for any client that trusts the header over the filename. Guess
+    # from the real extension instead, falling back to the old PDF
+    # default only when the type genuinely can't be determined.
+    media_type = mimetypes.guess_type(path.name)[0] or "application/pdf"
+    return FileResponse(str(path), filename=path.name, media_type=media_type)
 
 
 @app.get("/api/courses/{org_unit_id}/modules")
