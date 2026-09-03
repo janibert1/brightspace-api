@@ -187,14 +187,43 @@ async def get_deadlines():
 
 class EnrollRequest(BaseModel):
     course_codes: list[str]
+    confirm: bool = False
 
 
 @app.post("/api/enroll")
 async def enroll(req: EnrollRequest):
-    """Write endpoint - BrightspaceClient.enroll does NOT check any kind
-    of approval/confirmation itself, so don't expose this port beyond
-    localhost, and put your own confirmation step in front of it."""
-    return await _run(BrightspaceClient.enroll, req.course_codes)
+    """Write endpoint - BrightspaceClient.enroll (real Discover-search-backed
+    implementation as of 2026-09-03, see its own docstring) does NOT check
+    any kind of approval/confirmation itself beyond the `confirm` flag, so
+    don't expose this port beyond localhost, and put your own real
+    confirmation/approval step in front of a confirm=True call - this is
+    what morning_check.py's maybe_trigger_enrollment() already does via
+    approval_gate.require_approval() before ever setting confirm=True."""
+    return await _run(BrightspaceClient.enroll, req.course_codes, req.confirm)
+
+
+@app.get("/api/discover/search")
+async def discover_search(q: str):
+    """Ad-hoc single-course Discover search - see
+    BrightspaceClient.search_discover's docstring. Each result includes
+    `self_assignable`; only self-assignable ones can go through
+    /api/discover/enroll."""
+    return await _run(BrightspaceClient.search_discover, q)
+
+
+class DiscoverEnrollRequest(BaseModel):
+    org_unit_id: str
+    confirm: bool = False
+
+
+@app.post("/api/discover/enroll")
+async def discover_enroll(req: DiscoverEnrollRequest):
+    """Self-enroll in one specific Discover course by orgUnitId (get one
+    from /api/discover/search first). Same confirm=False-is-a-dry-run
+    safety as /api/enroll - see BrightspaceClient.enroll_discover's
+    docstring for exactly what confirm=True actually does (a real,
+    one-shot, unconfirmed-by-the-API-itself enrollment POST)."""
+    return await _run(BrightspaceClient.enroll_discover, req.org_unit_id, req.confirm)
 
 
 class UploadRequest(BaseModel):

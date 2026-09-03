@@ -1058,18 +1058,223 @@ class BrightspaceClient:
     # Write endpoints - unimplemented stubs, see each docstring
     # ------------------------------------------------------------------
 
-    def enroll(self, course_codes: list[str]) -> dict:
-        """Not implemented - this whole flow (search -> find course ->
-        click enroll -> confirm) needs to be built against your
-        institution's actual course-enrollment UI. No built-in
-        confirmation/approval check either - add your own before calling
-        this for real once it's implemented."""
+    # ------------------------------------------------------------------
+    # Discover self-enrollment
+    # ------------------------------------------------------------------
+    #
+    # Built 2026-09-03 after Discover's search-results page turned out to
+    # be a Lit/shadow-DOM SPA (`discovery-app.js`) that plain Playwright
+    # locators (CSS `:has-text`, `get_by_role`) could NOT find anything
+    # in at all - not even the top-level "Browse All Content" link
+    # sometimes. Rather than fight another multi-level shadow-DOM walk
+    # (get_courses' WALK_LINKS_JS / WALK_SHADOW_JS pattern above is doable
+    # but was explicitly deemed "not worth reverse engineering" for a
+    # SIMILAR case in this same file - see the module docstring's
+    # deadlines-widget paragraph) - network-captured what discovery-app.js
+    # itself calls, and it's a genuinely clean, real REST API. Using it
+    # directly is more robust than a shadow walk would have been, not a
+    # shortcut.
+    #
+    # The dance, confirmed live end-to-end (search worked, a real course's
+    # self-enroll action was inspected - the actual POST was deliberately
+    # never fired, see enroll_discover()'s docstring):
+    #   1. GET any lightweight Brightspace page once, so the page's own
+    #      inline bootstrap script populates `localStorage['XSRF.Token']`
+    #      (this is NOT a cookie - it's set by a `<script>` tag embedded
+    #      in the HTML response itself, so it needs one real page load,
+    #      not just the saved session cookies).
+    #   2. POST /d2l/lp/auth/oauth2/token (same origin, brightspace.tudelft.nl,
+    #      form-encoded body `scope=*:*:*`, header `x-csrf-token: <that
+    #      token>`) - returns a short-lived (~1h, per its own `exp` claim)
+    #      Bearer JWT. This is a real, general D2L SPA-auth pattern, not
+    #      Discover-specific - reusable for other *.api.brightspace.com
+    #      hosts if a future method needs one (see the deadlines-widget
+    #      note above for a case that would also benefit from this instead
+    #      of a shadow walk).
+    #   3. That Bearer JWT authenticates plain GET/POST calls to
+    #      `eu-west-1.discovery.bff.api.brightspace.com` (a completely
+    #      separate host from brightspace.tudelft.nl - cross-origin, hence
+    #      needing its own bearer auth rather than riding on cookies the
+    #      way `_api_get`'s same-origin `/d2l/api/...` calls do).
+    #      - `GET /search?q=<query>&page=0&sort=relevant` - Siren+JSON
+    #        (`application/vnd.siren+json`) collection. Each result
+    #        `entity` has `properties.orgUnitId`/`title`, and its `class`
+    #        list includes `"self-assignable"` when self-enrollment is
+    #        actually available for it (confirmed live: NOT every search
+    #        result carries this - don't assume a hit is enrollable
+    #        without checking).
+    #      - `GET /course/<orgUnitId>` - Siren detail for one course. If
+    #        self-assignable, its `actions` list includes one named
+    #        `"assign"` (`POST /assign/course/<orgUnitId>`, `type:
+    #        application/json`) - THIS is the real self-enroll call.
+    #
+    # **Confirmed live 2026-09-03, real search miss**: searching for
+    # "Rigid-Body Dynamics"/"Rigid"/"WB2630 Toets" all returned 0 hits for
+    # that exact course, despite a real announcement (Arno Stienen,
+    # 2026-08-31) telling students to self-enroll in "WB2630 Toets 1
+    # Rigid-Body Dynamics" via Discover - the course genuinely isn't
+    # indexed/searchable there yet (not a scraper bug; the raw BFF search
+    # API itself returns 0 entities). If this method reports "not found"
+    # for something an announcement says should be there, that's a real
+    # finding to report, not necessarily something to keep retrying
+    # blindly - though a short retry over the following days (indexing
+    # lag, or the course manager activating it late) is reasonable.
+
+    def _discover_auth_headers(self, context, page) -> dict:
+        """Returns {"authorization": "Bearer ...", "accept": "application/vnd.siren+json"}.
+        Does the page-load + oauth2/token dance described above. Cheap
+        enough (one throwaway page load + one POST) to just do fresh every
+        call rather than caching/reusing a token across calls - this is
+        not a hot path."""
+        base_url = self._base_url()
+        page.goto(f"{base_url}/d2l/le/discovery/view/", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(1500)
+        xsrf = page.evaluate("() => localStorage.getItem('XSRF.Token')")
+        if not xsrf:
+            raise BrightspaceError("No XSRF.Token in localStorage after loading the Discover page - "
+                                    "session may be stale/expired.")
+        resp = context.request.post(
+            f"{base_url}/d2l/lp/auth/oauth2/token",
+            headers={"x-csrf-token": xsrf, "content-type": "application/x-www-form-urlencoded"},
+            data="scope=*:*:*",
+        )
+        if resp.status != 200:
+            raise BrightspaceError(f"oauth2/token exchange failed ({resp.status}): {resp.text()[:300]}")
+        access_token = resp.json()["access_token"]
+        return {"authorization": f"Bearer {access_token}", "accept": "application/vnd.siren+json"}
+
+    def search_discover(self, query: str) -> list[dict]:
+        """Live search against Discover's real backend. Returns
+        [{"org_unit_id": "844809", "title": "...", "self_assignable": bool}, ...]
+        - empty list means a genuine zero-result search (see the "real
+        search miss" note above), not necessarily a broken query."""
         context, page = self._new_page()
         try:
-            return {code: "NOT_IMPLEMENTED - selectors need to be filled in against the real site"
-                    for code in course_codes}
+            headers = self._discover_auth_headers(context, page)
+            resp = context.request.get(
+                "https://eu-west-1.discovery.bff.api.brightspace.com/search",
+                params={"q": query, "page": 0, "sort": "relevant"},
+                headers=headers,
+            )
+            if resp.status != 200:
+                raise BrightspaceError(f"Discover search failed ({resp.status}): {resp.text()[:300]}")
+            data = resp.json()
+            results = []
+            for e in data.get("entities", []):
+                props = e.get("properties", {})
+                results.append({
+                    "org_unit_id": str(props.get("orgUnitId")),
+                    "title": props.get("title"),
+                    "self_assignable": "self-assignable" in e.get("class", []),
+                })
+            return results
         finally:
             context.close()
+
+    def get_discover_course(self, org_unit_id: str | int) -> dict:
+        """Siren detail for one course - {"org_unit_id", "title",
+        "self_assignable", "assign_href"} where `assign_href` is the real
+        self-enroll POST url if self-assignable, else None. Use this to
+        confirm a course is actually enrollable (and see its exact title)
+        before calling enroll_discover() on it."""
+        context, page = self._new_page()
+        try:
+            headers = self._discover_auth_headers(context, page)
+            resp = context.request.get(
+                f"https://eu-west-1.discovery.bff.api.brightspace.com/course/{org_unit_id}",
+                headers=headers,
+            )
+            if resp.status != 200:
+                raise BrightspaceError(f"Discover course lookup failed ({resp.status}): {resp.text()[:300]}")
+            data = resp.json()
+            assign_action = next((a for a in data.get("actions", []) if a.get("name") == "assign"), None)
+            return {
+                "org_unit_id": str(data.get("properties", {}).get("orgUnitId", org_unit_id)),
+                "title": data.get("properties", {}).get("title"),
+                "self_assignable": "self-assignable" in data.get("class", []),
+                "assign_href": assign_action["href"] if assign_action else None,
+            }
+        finally:
+            context.close()
+
+    def enroll_discover(self, org_unit_id: str | int, confirm: bool = False) -> dict:
+        """Self-enrolls in one Discover course via its "assign" action.
+
+        **`confirm` defaults to False on purpose, and the actual POST has
+        NEVER been fired live while building this** - same reasoning as
+        `upload()`'s `confirm_submit` above: this is the API-level call
+        behind Discover's "Enroll" button, and unlike the UI (which shows
+        its own confirm step before this fires) the raw API gives no
+        indication it stages anything first - the "assign" action's Siren
+        schema lists no separate confirm/staging action, only this one
+        POST. Treat it as a real, immediate, one-shot academic enrollment
+        action: with `confirm=False` (the default) this only looks up the
+        course and returns what WOULD happen, with nothing sent to
+        Brightspace. Only pass `confirm=True` once you (or whoever's
+        calling this - see server.py's /api/discover/enroll and
+        approval_gate.require_approval() in core-logic) actually wants the
+        real enrollment to happen right now.
+
+        Returns {"org_unit_id", "title", "self_assignable", "enrolled": bool,
+        "reason": str | None} - `enrolled` is only ever True when `confirm=True`
+        AND the course was actually self-assignable AND the POST succeeded.
+        """
+        course = self.get_discover_course(org_unit_id)
+        if not course["self_assignable"] or not course["assign_href"]:
+            return {**course, "enrolled": False,
+                    "reason": "Course is not self-assignable (no 'assign' action available)."}
+        if not confirm:
+            return {**course, "enrolled": False,
+                    "reason": "confirm=False (dry run) - would have POSTed to assign_href. "
+                              "Call again with confirm=True to actually enroll."}
+
+        context, page = self._new_page()
+        try:
+            headers = self._discover_auth_headers(context, page)
+            headers["content-type"] = "application/json"
+            resp = context.request.post(course["assign_href"], headers=headers, data="{}")
+            if resp.status not in (200, 201, 204):
+                return {**course, "enrolled": False,
+                        "reason": f"assign POST failed ({resp.status}): {resp.text()[:300]}"}
+            return {**course, "enrolled": True, "reason": None}
+        finally:
+            context.close()
+
+    def enroll(self, course_codes: list[str], confirm: bool = False) -> dict:
+        """Convenience wrapper for the existing course-code-list callers
+        (morning_check.py's maybe_trigger_enrollment / /api/enroll) -
+        search_discover()'s each code, take the first self-assignable
+        result (there is deliberately no fuzzy "best match" scoring here -
+        a course CODE should search precisely; if a code returns multiple
+        self-assignable hits, that's worth a human look, not a silent
+        pick), and enroll_discover() it. Same confirm=False-by-default
+        safety as enroll_discover() - this can dry-run the whole batch
+        before committing to anything.
+
+        Returns {course_code: result_dict_from_enroll_discover_or_error}."""
+        results = {}
+        for code in course_codes:
+            matches = self.search_discover(code)
+            self_assignable = [m for m in matches if m["self_assignable"]]
+            if not self_assignable:
+                results[code] = {
+                    "org_unit_id": None, "title": None, "self_assignable": False,
+                    "enrolled": False,
+                    "reason": f"No self-assignable Discover result for {code!r} "
+                              f"({len(matches)} total match(es), none enrollable).",
+                }
+                continue
+            if len(self_assignable) > 1:
+                results[code] = {
+                    "org_unit_id": None, "title": None, "self_assignable": True,
+                    "enrolled": False,
+                    "reason": f"{len(self_assignable)} self-assignable matches for {code!r} - "
+                              f"ambiguous, needs a human pick: "
+                              f"{[m['title'] for m in self_assignable]}",
+                }
+                continue
+            results[code] = self.enroll_discover(self_assignable[0]["org_unit_id"], confirm=confirm)
+        return results
 
     def upload(self, assignment_url: str, file_paths: list[str] | str, confirm_submit: bool = False) -> dict:
         """Submits file(s) to a Dropbox/Assignment folder. `assignment_url`

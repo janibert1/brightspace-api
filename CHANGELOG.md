@@ -5,6 +5,26 @@ real Brightspace account, not a guess — see the corresponding method's
 own docstring in `client.py`/`session.py` for the full technical detail
 behind each line.
 
+## 0.7.0
+
+- Added real Discover self-enrollment support: `search_discover(query)`,
+  `get_discover_course(org_unit_id)`, `enroll_discover(org_unit_id,
+  confirm=False)`, and a real `enroll(course_codes, confirm=False)`
+  (previously a `NOT_IMPLEMENTED` stub). Discover's own search-results
+  page is a shadow-DOM SPA that plain Playwright locators can't find
+  anything in — instead of walking the shadow tree, this hits the real
+  Siren+JSON REST API the SPA itself calls
+  (`eu-west-1.discovery.bff.api.brightspace.com`), authenticated via a
+  same-origin `oauth2/token` exchange using an `XSRF.Token` value the
+  page sets in `localStorage` (not a cookie) on load. `confirm` defaults
+  to `False` everywhere here and is a true dry run — the actual
+  self-enroll POST was deliberately never fired live while building
+  this, since Discover's own UI shows a confirm step the raw API does
+  not replicate. New server routes: `GET /api/discover/search?q=...`,
+  `POST /api/discover/enroll {org_unit_id, confirm}`; `POST /api/enroll`
+  now takes an optional `confirm` field too. See `search_discover`'s
+  docstring for the full auth-dance writeup.
+
 ## 0.6.4
 
 - Fixed `download_course_file`'s FastAPI route hardcoding
